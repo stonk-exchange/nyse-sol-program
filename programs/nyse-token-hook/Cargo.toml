@@ -1,0 +1,25 @@
+[package]
+name = "nyse-token-hook"
+version = "0.1.0"
+description = "NYSE Trading Hours Transfer Hook for Token-2022"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "nyse_token_hook"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+chrono = { version = "0.4", features = ["serde"] }
+spl-transfer-hook-interface = "0.8.0"
+spl-tlv-account-resolution = "0.7.0"
+
