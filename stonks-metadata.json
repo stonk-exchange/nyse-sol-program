@@ -1,0 +1,45 @@
+{
+  "name": "STONKS",
+  "symbol": "STONKS",
+  "description": "NYSE-compliant token that enforces stock market trading hours on-chain. Transfers are only allowed during NYSE market hours (9:30 AM - 4:00 PM ET, Monday-Friday) and blocked on weekends and holidays.",
+  "image": "https://arweave.net/your-image-here",
+  "external_url": "https://github.com/your-project/nyse-token-hook",
+  "attributes": [
+    {
+      "trait_type": "Market Hours",
+      "value": "9:30 AM - 4:00 PM ET"
+    },
+    {
+      "trait_type": "Trading Days",
+      "value": "Monday - Friday"
+    },
+    {
+      "trait_type": "Weekend Trading",
+      "value": "Blocked"
+    },
+    {
+      "trait_type": "Holiday Trading",
+      "value": "Blocked"
+    },
+    {
+      "trait_type": "Timezone",
+      "value": "Eastern Time (EST/EDT)"
+    },
+    {
+      "trait_type": "Enforcement",
+      "value": "On-chain Transfer Hook"
+    },
+    {
+      "trait_type": "Bypass Possible",
+      "value": "No"
+    },
+    {
+      "trait_type": "Token Standard",
+      "value": "SPL Token 2022"
+    }
+  ],
+  "properties": {
+    "category": "utility",
+    "creators": []
+  }
+}

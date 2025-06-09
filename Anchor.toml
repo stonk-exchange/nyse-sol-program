@@ -9,6 +9,12 @@ skip-lint = false
 [programs.localnet]
 nyse_token_hook = "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k"
 
+[programs.testnet]
+nyse_token_hook = "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k"
+
+[programs.devnet]
+nyse_token_hook = "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k"
+
 [registry]
 url = "https://api.apr.dev"
 

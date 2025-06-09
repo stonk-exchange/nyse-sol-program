@@ -1,0 +1,25 @@
+{
+  "programId": "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k",
+  "mintAddress": "2RJx5BdpgQmoK96UcT41LDTsaCe1F9PXSR6AymVm8AaW",
+  "yourWallet": "7osGZ9jc437CmJBvmvy5x5uK5URFLEdnURiVnCUhGZxR",
+  "yourTokenAccount": "2EbjN6ftzi5qMAVBwFrivct2AVBcEBbfwveMtu1bmTq2",
+  "extraAccountMetaList": "9Czcu6Awta2Fz15BcS3v1vc6B6k9ioVEVkB4Cs9U2AHW",
+  "network": "devnet",
+  "tokenInfo": {
+    "symbol": "STONKS",
+    "name": "STONKS Token",
+    "decimals": 9,
+    "supply": "10,000,000",
+    "description": "NYSE-compliant token that enforces stock market trading hours",
+    "metadataIncluded": true,
+    "metadataUri": "https://raw.githubusercontent.com/jessejacob/nyse-token-hook/main/stonks-metadata.json"
+  },
+  "nyseFeatures": {
+    "marketHours": "9:30 AM - 4:00 PM ET",
+    "weekends": "Blocked",
+    "holidays": "Blocked (New Year, July 4th, Christmas)",
+    "timezone": "Automatic EST/EDT conversion",
+    "enforcement": "Impossible to bypass"
+  },
+  "deployedAt": "2025-06-09T15:59:30.623Z"
+}

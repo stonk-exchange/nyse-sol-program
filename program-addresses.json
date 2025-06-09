@@ -1,0 +1,11 @@
+{
+  "nyse_token_hook": {
+    "localnet": "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k",
+    "testnet": "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k",
+    "devnet": "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k",
+    "deployed_at": {
+      "testnet": "2024-12-09T12:00:00Z",
+      "devnet": "2024-12-09T12:47:00Z"
+    }
+  }
+}

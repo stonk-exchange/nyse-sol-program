@@ -1,0 +1,12 @@
+{
+  "programId": "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k",
+  "mintAddress": "FubK4nxGywUEPpb2VVAexKbs19dG4eYSo5y2pczsSSd",
+  "tokenAccount": "32JCq8BK1QJDeWhALJXBrqcbcuuMgppu5qwYs1coV24C",
+  "extraAccountMetaList": "64jQihZocFbdh17fkVX5sjvpKuKqhruv7598dKUbGq3Q",
+  "network": "testnet",
+  "symbol": "STONK",
+  "name": "STONK Token",
+  "decimals": 9,
+  "supply": "1000000",
+  "deployedAt": "2025-06-09T00:16:53.208Z"
+}
