@@ -1,207 +1,190 @@
-# NYSE Token Hook - BULLETPROOF NYSE COMPLIANCE FOR SOLANA DEXs
+# NYSE Token Hook
 
-🎯 **MISSION**: Create tokens that automatically enforce NYSE trading hours on ANY Solana DEX (Raydium, Orca, Jupiter) with ZERO bypasses possible.
+A Token-2022 **transfer hook** that rejects transfers outside NYSE trading hours.
+The program is stateless: on every transfer Token-2022 CPIs into it, and it
+computes the current NYSE session from the on-chain `Clock` and either returns
+`Ok` or an error that aborts the whole transaction.
 
-## 🚀 HOW IT WORKS
+**Status: unaudited. Deployed to devnet only. Not ready for mainnet** — see
+[Before mainnet](#before-mainnet).
 
-This solution uses **Token-2022 Transfer Hooks** - the most powerful way to control token transfers on Solana:
+## Market calendar
 
-1. **Token-2022 Transfer Hook** runs on EVERY transfer
-2. **NYSE Hours Logic** checks current time against market schedule
-3. **Market Closed** → Transfer BLOCKED with custom error
-4. **Market Open** → Transfer allowed normally
+Transfers are permitted Monday–Friday, 09:30–16:00 ET, except:
 
-## 🛡️ SECURITY GUARANTEES
+| Blocked | Detail |
+| --- | --- |
+| Weekends | Saturday and Sunday |
+| Full closures | New Year's Day, MLK Day, Washington's Birthday, Good Friday, Memorial Day, Juneteenth, Independence Day, Labor Day, Thanksgiving, Christmas |
+| Outside session | Before 09:30 ET, at or after 16:00 ET |
 
-✅ **Unbypassable**: Runs at SPL Token-2022 level  
-✅ **DEX Agnostic**: Works with ANY DEX automatically  
-✅ **Future Proof**: Works with future DEXs too  
-✅ **Complete Coverage**: Blocks wallets, DEXs, direct transfers, everything
+NYSE closes at 13:00 ET on a few days (July 3, the Friday after Thanksgiving,
+Christmas Eve). This program **deliberately does not enforce those** — the
+session is a uniform 09:30–16:00 on every trading day. The test suite pins that
+choice so it cannot regress silently.
 
-## 📊 NYSE MARKET SCHEDULE
+Holiday observance follows NYSE Rule 7.2: a holiday on Saturday moves to the
+preceding Friday and one on Sunday to the following Monday, except New Year's
+Day, which is not observed on the preceding December 31.
 
-**Trading Allowed**: Monday-Friday 9:30 AM - 4:00 PM ET  
-**Trading Blocked**:
+Eastern Time is computed from the post-2007 US DST rule (second Sunday in March
+02:00 EST through the first Sunday in November 02:00 EDT). Dates use Howard
+Hinnant's `days_from_civil`/`civil_from_days`, which are leap-year exact.
 
-- Weekends
-- NYSE Holidays (New Year's, Christmas, etc.)
-- After Hours (before 9:30 AM, after 4:00 PM ET)
+## Errors
 
-## 🏗️ DEPLOYMENT GUIDE
+| Code | Error | Meaning |
+| --- | --- | --- |
+| 6000 | `MarketClosedWeekend` | Saturday or Sunday |
+| 6001 | `MarketClosedHoliday` | Exchange holiday |
+| 6002 | `MarketClosedPreMarket` | Before 09:30 ET |
+| 6003 | `MarketClosedAfterHours` | At or after 16:00 ET |
+| 6004 | `NotTransferring` | `Execute` called outside a real transfer |
+| 6005 | `InvalidTokenAccount` | Source account is not parseable Token-2022 state |
+| 6006 | `UnsupportedInstruction` | Non-`Execute` transfer-hook instruction |
 
-### Step 1: Deploy Transfer Hook Program
+## Testing
 
 ```bash
-# Clone and build
-git clone <this-repo>
-cd nyse-token-hook
+cargo test -p nyse-token-hook
+```
+
+14 unit tests over the calendar logic. The market-state table is generated from
+the IANA tz database rather than written by hand, so it is independent of the
+code it checks:
+
+```bash
+python3 scripts/gen_market_table.py --check   # verify the DST rule against tzdata
+python3 scripts/gen_market_table.py           # regenerate the table
+```
+
+```bash
+anchor build && npx ts-mocha -p ./tsconfig.json -t 1000000 'tests/**/*.ts'
+```
+
+25 integration tests that run the compiled program under LiteSVM with a
+controlled clock, attempting real Token-2022 transfers at each market state and
+asserting on the on-chain result and the token balances.
+
+## Launching
+
+Blocking transfers is only half the job. A mint whose authorities are still live
+can be inflated, frozen, or have its hook repointed at a no-op program, so the
+launch must close those doors permanently.
+
+### 1. Build and deploy the program
+
+```bash
 anchor build
-anchor deploy
+anchor deploy --provider.cluster devnet
 ```
 
-### Step 2: Create NYSE-Compliant Token
+### 2. Launch the mint
 
-```typescript
-import {
-  TOKEN_2022_PROGRAM_ID,
-  createInitializeTransferHookInstruction,
-  createInitializeMintInstruction,
-  ExtensionType,
-  getMintLen,
-} from "@solana/spl-token";
-
-// Your deployed program ID
-const NYSE_HOOK_PROGRAM = "CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k";
-
-// Create mint with transfer hook
-const extensions = [ExtensionType.TransferHook];
-const mintLen = getMintLen(extensions);
-
-// Initialize transfer hook extension
-const initTransferHookInstruction = createInitializeTransferHookInstruction(
-  mint,
-  authority.publicKey,
-  NYSE_HOOK_PROGRAM, // Our NYSE compliance program
-  TOKEN_2022_PROGRAM_ID
-);
-```
-
-### Step 3: Create Raydium Pools
-
-Create Raydium pools normally - they will automatically respect NYSE hours!
-
-### Step 4: Enjoy Perfect Compliance
-
-🎉 **Result**: Your token now enforces NYSE trading hours across ALL DEXs!
-
-## 📈 REAL-WORLD BEHAVIOR
-
-### During Market Hours (Mon-Fri 9:30 AM - 4:00 PM ET)
-
-✅ Raydium swaps work normally  
-✅ Wallet transfers work normally  
-✅ All trading activity allowed
-
-### Outside Market Hours
-
-🚫 Raydium swaps blocked with NYSE error  
-🚫 Wallet transfers blocked with NYSE error  
-🚫 ALL trading activity blocked
-
-## 🔧 TECHNICAL DETAILS
-
-### Program ID
-
-```
-CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k
-```
-
-### Core Functions
-
-- `initialize_extra_account_meta_list()`: Setup transfer hook
-- `execute()`: Runs on every transfer, validates NYSE hours
-
-### Market State Detection
-
-- **HOLIDAY**: NYSE holidays (New Year's, Christmas, etc.)
-- **WEEKEND**: Saturday/Sunday
-- **AFTER_HOURS**: Before 9:30 AM or after 4:00 PM ET
-- **OPEN**: Trading hours (Mon-Fri 9:30 AM - 4:00 PM ET)
-
-### Time Zone Handling
-
-- Automatically handles Eastern Time
-- Daylight Saving Time support
-- Precise holiday calendar
-
-## 📋 ERROR MESSAGES
-
-When transfers are blocked, users see clear NYSE compliance messages:
-
-```
-🚫 NYSE CLOSED: Market is closed for weekend
-🚫 NYSE CLOSED: Market is closed for holiday
-🚫 NYSE CLOSED: Market is closed after hours
-```
-
-## 🎯 WHY THIS SOLUTION IS UNIQUE
-
-### ❌ Other Approaches Fail:
-
-- **Custom Transfer Instructions**: DEXs bypass with direct SPL calls
-- **Freeze Authority**: Only affects specific accounts, not DEX pools
-- **Wrapper Tokens**: Complex, can be unwrapped
-
-### ✅ Transfer Hooks Win:
-
-- **Run on EVERY transfer** - no bypasses possible
-- **DEX Agnostic** - works with any DEX automatically
-- **Native Integration** - uses SPL Token-2022 built-in functionality
-
-## 🏦 RAYDIUM INTEGRATION EXAMPLE
-
-```typescript
-// 1. Create NYSE-compliant token (see above)
-// 2. Create Raydium pool normally
-const pool = await createRaydiumPool({
-  baseToken: nyseCompliantToken,
-  quoteToken: USDC,
-  // ... other parameters
-});
-
-// 3. Result: Pool automatically respects NYSE hours!
-// During market hours: ✅ Swaps work
-// Outside market hours: 🚫 Swaps blocked
-```
-
-## 🧪 TESTING
+[scripts/launch-token.ts](scripts/launch-token.ts) creates the mint with on-chain
+metadata, mints the entire supply once, and revokes every mint-level authority in
+the process. It dry-runs by default:
 
 ```bash
-# Run all tests
-anchor test
-
-# Test specific scenarios
-yarn test:market-hours
-yarn test:weekend-blocking
-yarn test:holiday-blocking
+ANCHOR_WALLET=~/.config/solana/id.json npx ts-node scripts/launch-token.ts \
+  --cluster devnet --name "STONKS" --symbol STONKS \
+  --uri https://example.com/metadata.json --supply 1000000 --decimals 9
 ```
 
-## 📊 TEST RESULTS
+Add `--execute` to send. Afterwards it reads the mint back from chain and
+verifies:
 
-✅ **11/11 tests passing**  
-✅ **Market state detection**: All scenarios covered  
-✅ **Transfer blocking**: Confirmed working  
-✅ **Token-2022 integration**: Validated
+| Check | Result |
+| --- | --- |
+| Supply | Exactly the requested amount |
+| Mint authority | Revoked — supply can never increase |
+| Freeze authority | Never set — no one can freeze or thaw a holder |
+| Transfer hook | Still points at this program |
+| Transfer hook authority | Revoked — the hook can never be repointed |
+| Metadata | Name, symbol and uri readable on-chain |
+| Metadata update authority | Revoked — name/symbol/image are immutable |
 
-## 🚀 MAINNET DEPLOYMENT
+Metadata uses the Token-2022 `MetadataPointer` + `TokenMetadata` extensions and
+is stored on the mint itself, so wallets, explorers and DEX aggregators resolve
+it with no Metaplex account. `--uri` should point at a JSON file with at least
+`name`, `symbol`, `description` and `image` — see
+[stonks-metadata.json](stonks-metadata.json).
 
-1. **Deploy program** to mainnet
-2. **Create tokens** with transfer hook enabled
-3. **Create DEX pools** normally
-4. **Enjoy automatic NYSE compliance**!
+Revoking the transfer hook authority is not optional. The test suite includes a
+mutation check showing that if it survives, the hook can be repointed at a no-op
+program and the market-hours restriction disappears entirely.
 
-## 🔍 VALIDATION PROOF
+### 3. Burn the program upgrade authority
 
-The test suite proves the transfer hook is working because:
+The mint is locked, but the *program* can still be upgraded, which would let the
+holder of that key rewrite the trading-hours rule for every token using the hook.
+This is the last centralised power:
 
-1. ✅ Token-2022 detects the transfer hook correctly
-2. ✅ Token-2022 attempts to call our program
-3. ✅ Transfer hook program executes NYSE logic
-4. ✅ Appropriate errors thrown during market closure
+```bash
+solana program set-upgrade-authority CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k --final
+```
 
-Even "Unknown program" errors are **PROOF OF SUCCESS** - they show Token-2022 is correctly calling our transfer hook!
+This is irreversible: bugs can never be patched afterwards. Audit first.
 
-## 🎉 CONCLUSION
+> [scripts/deploy-stonks-token.ts](scripts/deploy-stonks-token.ts) is the older
+> devnet script. It leaves the mint and transfer-hook authorities live, so the
+> token it produces is inflatable and the hook is removable. Use
+> `launch-token.ts` for anything real.
 
-This NYSE Token Hook provides **bulletproof NYSE compliance** for any Solana token on any DEX. Deploy once, enjoy automatic compliance forever!
+### 3. Transferring
 
-**Perfect for**:
+Wallets and programs must append the hook's accounts to `TransferChecked`. This
+hook resolves zero extra accounts, so that is just the hook program ID followed
+by the validation-state PDA — which is what
+`createTransferCheckedWithTransferHookInstruction` produces.
 
-- TradFi tokenization projects
-- Regulated securities on Solana
-- Compliance-focused DeFi protocols
-- NYSE-listed company tokens
+## Limitations
 
----
+**Venue support is the binding constraint.** A transfer hook can make a transfer
+fail, so AMMs and routers have to opt into supporting arbitrary hook programs;
+many do not. Confirm that the venues you care about will list a hooked
+Token-2022 mint *before* building on this. This is a property of the ecosystem,
+not something the hook can fix.
 
-_Built with ❤️ for perfect NYSE compliance on Solana_
+**Only transfers are gated.** Token-2022 invokes a transfer hook from
+`Transfer`/`TransferChecked` and nowhere else. Burning, minting, and approving a
+delegate are all unaffected by market hours — the integration suite asserts this
+explicitly. Revoking the mint and freeze authorities at launch closes all of
+these except burning.
+
+**Burning can never be blocked.** Any holder can always burn their own tokens,
+including while the market is closed, and no Token-2022 extension prevents it.
+Supply is therefore fixed at launch and monotonically non-increasing, rather than
+strictly constant. Burning is not a transfer, so it cannot be used to move value
+or trade outside market hours.
+
+**Exposure is transferable even when the token is not.** Anything that holds the
+token and is itself a different mint — an LP position, a vault share, a wrapper —
+has no hook on it and moves freely 24/7. The hook locks this mint, not the
+economic exposure to it.
+
+**Unscheduled closures are not modelled.** NYSE closes for national days of
+mourning and severe weather with no fixed rule. The program will permit trading
+on those days.
+
+**The hook does not stop price discovery.** It blocks on-chain transfers of the
+mint. It does not prevent off-chain trading, derivatives, or wrapped claims on
+the token from being priced while the NYSE is closed.
+
+**Time comes from the validator clock.** `Clock::unix_timestamp` is a
+stake-weighted estimate, not an exact wall clock, and can drift from real time.
+Transfers near the open and close may be decided a little early or late.
+
+**Only the post-2007 DST rule is implemented.** If US DST law changes, the
+program needs an upgrade. The same is true for changes to the NYSE calendar.
+
+## Before mainnet
+
+- [ ] Independent security audit. A bug in this program freezes holders' funds.
+- [ ] Confirm the venues you intend to list on support arbitrary transfer hooks.
+- [ ] Decide and document who controls the program upgrade authority. As
+      deployed it is a single hot wallet, which means that key can change or
+      disable the trading-hours rule for every token using the hook.
+- [ ] Set the mint's transfer-hook authority to `None` at launch, or the hook
+      can be repointed at a no-op program.
+- [ ] Revoke mint authority if the supply is meant to be fixed.

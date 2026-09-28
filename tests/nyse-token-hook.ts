@@ -1,607 +1,828 @@
-import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { NyseTokenHook } from "../target/types/nyse_token_hook";
-import { expect } from "chai";
+/**
+ * Integration tests for the NYSE transfer hook.
+ *
+ * These run against LiteSVM with a controlled clock, so every market state is
+ * exercised deterministically -- a real Token-2022 transfer is attempted at each
+ * timestamp and we assert on the actual on-chain outcome. Timestamps are exact
+ * UTC epochs for the stated Eastern wall-clock time, derived from the IANA tz
+ * database (see scripts/gen_market_table.py).
+ */
+import { LiteSVM, Clock, FailedTransactionMetadata } from "litesvm";
 import {
-  PublicKey,
   Keypair,
+  PublicKey,
   SystemProgram,
-  LAMPORTS_PER_SOL,
+  Transaction,
+  TransactionInstruction,
 } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
-  createMint,
-  mintTo,
-  transferChecked,
-  getAssociatedTokenAddressSync,
   ASSOCIATED_TOKEN_PROGRAM_ID,
-  createAssociatedTokenAccountInstruction,
   ExtensionType,
   getMintLen,
   createInitializeMintInstruction,
   createInitializeTransferHookInstruction,
-  createTransferCheckedWithTransferHookInstruction,
+  createAssociatedTokenAccountInstruction,
+  createMintToInstruction,
+  createBurnInstruction,
+  createApproveInstruction,
+  createSetAuthorityInstruction,
+  createUpdateTransferHookInstruction,
+  AuthorityType,
+  unpackMint,
+  getTransferHook,
+  getExtensionData,
+  createInitializeMetadataPointerInstruction,
+  LENGTH_SIZE,
+  TYPE_SIZE,
+  createTransferCheckedInstruction,
+  getAssociatedTokenAddressSync,
+  getAccount,
 } from "@solana/spl-token";
+import {
+  pack,
+  unpack as unpackMetadata,
+  createInitializeInstruction as createInitializeMetadataInstruction,
+  createUpdateAuthorityInstruction as createUpdateMetadataAuthorityInstruction,
+  type TokenMetadata,
+} from "@solana/spl-token-metadata";
+import { createHash } from "crypto";
+import { expect } from "chai";
+import * as fs from "fs";
 
-describe("NYSE Token Hook - REAL-TIME TESTING", () => {
-  const provider = anchor.AnchorProvider.env();
-  anchor.setProvider(provider);
+const PROGRAM_ID = new PublicKey("CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k");
+const SO_PATH = "target/deploy/nyse_token_hook.so";
+const DECIMALS = 9;
 
-  const program = anchor.workspace.NyseTokenHook as Program<NyseTokenHook>;
-  const authority = provider.wallet as anchor.Wallet;
+/** Anchor error codes, in declaration order from NyseError. */
+const ERR = {
+  WEEKEND: 6000,
+  HOLIDAY: 6001,
+  PRE_MARKET: 6002,
+  AFTER_HOURS: 6003,
+  NOT_TRANSFERRING: 6004,
+};
 
-  let nyseMint: PublicKey;
-  let user1Account: PublicKey;
-  let user2Account: PublicKey;
-  let extraAccountMetaListPda: PublicKey;
+/** Exact UTC epochs for the stated Eastern wall-clock times. */
+const T = {
+  openRegular: { ts: 1790607600n, label: "2026-09-28 Mon 11:00 ET" },
+  weekend: { ts: 1790434800n, label: "2026-09-26 Sat 11:00 ET" },
+  holidayChristmas: { ts: 1798214400n, label: "2026-12-25 Fri 11:00 ET" },
+  preMarket: { ts: 1790600400n, label: "2026-09-28 Mon 09:00 ET" },
+  afterHours: { ts: 1790627400n, label: "2026-09-28 Mon 16:30 ET" },
+  openAtBell: { ts: 1790602200n, label: "2026-09-28 Mon 09:30 ET" },
+  lastMinute: { ts: 1790625540n, label: "2026-09-28 Mon 15:59 ET" },
+  // NYSE closes at 13:00 ET on these days; we deliberately trade a full session.
+  nyseHalfDayAfternoon: { ts: 1795806000n, label: "2026-11-27 Fri 14:00 ET (NYSE half-day)" },
+  nyseHalfDayClose: { ts: 1798145700n, label: "2026-12-24 Thu 15:55 ET (NYSE half-day)" },
+  regressionDec11: { ts: 1797004800n, label: "2026-12-11 Fri 11:00 ET" },
+  regressionOct20: { ts: 1792503900n, label: "2026-10-20 Tue 09:45 ET" },
+};
 
-  const user1 = Keypair.generate();
-  const user2 = Keypair.generate();
-  const mintKeypair = Keypair.generate();
+function anchorDiscriminator(name: string): Buffer {
+  return createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
+}
 
-  before(async () => {
-    // Airdrop SOL to test accounts
-    await provider.connection.confirmTransaction(
-      await provider.connection.requestAirdrop(
-        user1.publicKey,
-        3 * LAMPORTS_PER_SOL
-      )
+describe("NYSE transfer hook", () => {
+  let svm: LiteSVM;
+  let payer: Keypair;
+  let mint: Keypair;
+  let extraMetas: PublicKey;
+  let source: PublicKey;
+  let destination: PublicKey;
+  let recipient: Keypair;
+
+  /**
+   * Assert a failure is the given Anchor custom error. litesvm renders these as
+   * an InstructionError with a Custom code, so we match the code precisely
+   * rather than substring-matching the whole error string.
+   */
+  function expectCustomError(
+    result: FailedTransactionMetadata,
+    code: number,
+    label: string
+  ) {
+    const err = JSON.stringify(result.err());
+    const rendered = `${err} ${result.err().toString()}`;
+    expect(
+      new RegExp(`\\b${code}\\b`).test(rendered),
+      `${label}: expected custom error ${code}, got ${rendered}`
+    ).to.be.true;
+  }
+
+  function setClock(unixTimestamp: bigint) {
+    const clock = svm.getClock();
+    clock.unixTimestamp = unixTimestamp;
+    svm.setClock(clock);
+  }
+
+  function send(ixs: TransactionInstruction[], signers: Keypair[]) {
+    // Each transaction needs a distinct blockhash, otherwise two identical
+    // transfers produce the same signature and the second is rejected as a
+    // duplicate rather than reaching the hook.
+    svm.expireBlockhash();
+    const tx = new Transaction();
+    tx.recentBlockhash = svm.latestBlockhash();
+    tx.feePayer = payer.publicKey;
+    ixs.forEach((ix) => tx.add(ix));
+    tx.sign(...signers);
+    return svm.sendTransaction(tx);
+  }
+
+  /**
+   * TransferChecked with the transfer-hook accounts appended. This hook resolves
+   * zero extra accounts, so Token-2022 expects exactly the hook program followed
+   * by the validation-state PDA -- matching what
+   * `addExtraAccountMetasForExecute` appends in @solana/spl-token.
+   */
+  function transferIx(amount: bigint): TransactionInstruction {
+    const ix = createTransferCheckedInstruction(
+      source,
+      mint.publicKey,
+      destination,
+      payer.publicKey,
+      amount,
+      DECIMALS,
+      [],
+      TOKEN_2022_PROGRAM_ID
     );
-    await provider.connection.confirmTransaction(
-      await provider.connection.requestAirdrop(
-        user2.publicKey,
-        3 * LAMPORTS_PER_SOL
-      )
+    ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
+    ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+    return ix;
+  }
+
+  function balances() {
+    const src = getAccount(
+      { getAccountInfo: (k: PublicKey) => svm.getAccount(k) } as any,
+      source,
+      undefined,
+      TOKEN_2022_PROGRAM_ID
+    );
+    return src;
+  }
+
+  function rawBalance(account: PublicKey): bigint {
+    const info = svm.getAccount(account);
+    if (!info) throw new Error("missing token account");
+    // SPL token account layout: amount is a u64 at offset 64.
+    return Buffer.from(info.data).readBigUInt64LE(64);
+  }
+
+  /** Assert the transfer lands and moves the tokens. */
+  function expectTransferAllowed(at: { ts: bigint; label: string }) {
+    setClock(at.ts);
+    const before = rawBalance(destination);
+    const result = send([transferIx(1_000n)], [payer]);
+    expect(
+      result instanceof FailedTransactionMetadata,
+      `${at.label}: expected transfer to succeed, got ${
+        result instanceof FailedTransactionMetadata ? result.err().toString() : ""
+      }`
+    ).to.be.false;
+    expect(rawBalance(destination) - before).to.equal(1_000n, `${at.label}: balance did not move`);
+  }
+
+  /** Assert the transfer is rejected with the given Anchor error code, and nothing moves. */
+  function expectTransferBlocked(at: { ts: bigint; label: string }, code: number) {
+    setClock(at.ts);
+    const srcBefore = rawBalance(source);
+    const dstBefore = rawBalance(destination);
+    const result = send([transferIx(1_000n)], [payer]);
+    expect(result instanceof FailedTransactionMetadata, `${at.label}: expected transfer to fail`).to
+      .be.true;
+    expectCustomError(result as FailedTransactionMetadata, code, at.label);
+    expect(rawBalance(source), `${at.label}: source balance changed`).to.equal(srcBefore);
+    expect(rawBalance(destination), `${at.label}: destination balance changed`).to.equal(dstBefore);
+  }
+
+  before(() => {
+    expect(fs.existsSync(SO_PATH), `build the program first: anchor build`).to.be.true;
+
+    svm = new LiteSVM().withBuiltins().withSplPrograms().withSysvars();
+    svm.addProgramFromFile(PROGRAM_ID, SO_PATH);
+
+    payer = Keypair.generate();
+    recipient = Keypair.generate();
+    mint = Keypair.generate();
+    svm.airdrop(payer.publicKey, 100_000_000_000n);
+
+    // A time when the market is open, so setup transfers are not blocked.
+    setClock(T.openRegular.ts);
+
+    [extraMetas] = PublicKey.findProgramAddressSync(
+      [Buffer.from("extra-account-metas"), mint.publicKey.toBuffer()],
+      PROGRAM_ID
     );
 
-    console.log("🚀 NYSE TOKEN-2022 REAL-TIME ENFORCEMENT TESTS");
-    console.log("═══════════════════════════════════════════════");
-    console.log(`📋 Program ID: ${program.programId.toString()}`);
-    console.log("🎯 Testing against ACTUAL current NYSE market state");
-  });
-
-  describe("🏗️  Setup NYSE Token-2022", () => {
-    it("Should create Token-2022 mint with NYSE transfer hook", async () => {
-      console.log("\n🏗️  Creating Token-2022 with NYSE Transfer Hook...");
-
-      // Calculate PDA for extra account meta list
-      [extraAccountMetaListPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("extra-account-metas"), mintKeypair.publicKey.toBuffer()],
-        program.programId
-      );
-
-      // Calculate mint length with transfer hook extension
-      const mintLen = getMintLen([ExtensionType.TransferHook]);
-      const mintLamports =
-        await provider.connection.getMinimumBalanceForRentExemption(mintLen);
-
-      // Create mint account
-      const createMintAccountInstruction = SystemProgram.createAccount({
-        fromPubkey: authority.publicKey,
-        newAccountPubkey: mintKeypair.publicKey,
-        space: mintLen,
-        lamports: mintLamports,
-        programId: TOKEN_2022_PROGRAM_ID,
-      });
-
-      // Initialize transfer hook extension
-      const initializeTransferHookInstruction =
+    // 1. Create the Token-2022 mint with the transfer hook extension.
+    const mintLen = getMintLen([ExtensionType.TransferHook]);
+    const createMint = send(
+      [
+        SystemProgram.createAccount({
+          fromPubkey: payer.publicKey,
+          newAccountPubkey: mint.publicKey,
+          space: mintLen,
+          lamports: Number(svm.minimumBalanceForRentExemption(BigInt(mintLen))),
+          programId: TOKEN_2022_PROGRAM_ID,
+        }),
         createInitializeTransferHookInstruction(
-          mintKeypair.publicKey,
-          authority.publicKey,
-          program.programId,
+          mint.publicKey,
+          payer.publicKey,
+          PROGRAM_ID,
           TOKEN_2022_PROGRAM_ID
-        );
-
-      // Initialize mint
-      const initializeMintInstruction = createInitializeMintInstruction(
-        mintKeypair.publicKey,
-        9,
-        authority.publicKey,
-        null,
-        TOKEN_2022_PROGRAM_ID
-      );
-
-      // Create mint transaction
-      const createMintTransaction = new anchor.web3.Transaction()
-        .add(createMintAccountInstruction)
-        .add(initializeTransferHookInstruction)
-        .add(initializeMintInstruction);
-
-      await provider.sendAndConfirm(createMintTransaction, [
-        authority.payer,
-        mintKeypair,
-      ]);
-
-      nyseMint = mintKeypair.publicKey;
-      console.log(`✅ NYSE Token-2022 Mint: ${nyseMint.toString()}`);
-    });
-
-    it("Should initialize extra account meta list", async () => {
-      console.log("\n📋 Initializing Extra Account Meta List...");
-
-      await program.methods
-        .initializeExtraAccountMetaList()
-        .accountsPartial({
-          payer: authority.publicKey,
-          extraAccountMetaList: extraAccountMetaListPda,
-          mint: nyseMint,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
-
-      console.log(
-        `✅ Extra Account Meta List: ${extraAccountMetaListPda.toString()}`
-      );
-    });
-
-    it("Should create token accounts and mint supply", async () => {
-      console.log("\n💰 Creating Token Accounts and Minting...");
-
-      // Create token accounts
-      user1Account = getAssociatedTokenAddressSync(
-        nyseMint,
-        user1.publicKey,
-        false,
-        TOKEN_2022_PROGRAM_ID
-      );
-
-      user2Account = getAssociatedTokenAddressSync(
-        nyseMint,
-        user2.publicKey,
-        false,
-        TOKEN_2022_PROGRAM_ID
-      );
-
-      // Create token accounts
-      const createAccountsTransaction = new anchor.web3.Transaction()
-        .add(
-          createAssociatedTokenAccountInstruction(
-            authority.publicKey,
-            user1Account,
-            user1.publicKey,
-            nyseMint,
-            TOKEN_2022_PROGRAM_ID
-          )
-        )
-        .add(
-          createAssociatedTokenAccountInstruction(
-            authority.publicKey,
-            user2Account,
-            user2.publicKey,
-            nyseMint,
-            TOKEN_2022_PROGRAM_ID
-          )
-        );
-
-      await provider.sendAndConfirm(createAccountsTransaction, [
-        authority.payer,
-      ]);
-
-      // Mint tokens to user1
-      await mintTo(
-        provider.connection,
-        authority.payer,
-        nyseMint,
-        user1Account,
-        authority.payer,
-        1000000 * 10 ** 9, // 1M tokens
-        [],
-        undefined,
-        TOKEN_2022_PROGRAM_ID
-      );
-
-      console.log("✅ Token accounts created and 1M tokens minted to user1");
-    });
-  });
-
-  describe("🎯 REAL-TIME NYSE ENFORCEMENT", () => {
-    it("Should enforce NYSE market hours based on current time", async () => {
-      console.log("\n🎯 TESTING CURRENT NYSE MARKET STATE");
-      console.log("═══════════════════════════════════════════");
-
-      // Get current market state
-      const now = new Date();
-      const marketState = getCurrentNYSEMarketState();
-
-      console.log(`📅 Current UTC Time: ${now.toISOString()}`);
-      console.log(`🕐 Eastern Time: ${marketState.easternTime}`);
-      console.log(
-        `📊 NYSE Status: ${marketState.status} (${marketState.reason})`
-      );
-
-      if (marketState.isOpen) {
-        console.log("\n✅ NYSE IS CURRENTLY OPEN - Testing allowed transfer");
-        await performTransferTest(
-          1000,
-          "Transfer during market hours should succeed"
-        );
-      } else {
-        console.log("\n🚫 NYSE IS CURRENTLY CLOSED - Testing blocked transfer");
-        await expectTransferToFail(
-          1000,
-          "Transfer during closed hours should be blocked"
-        );
-      }
-    });
-
-    it("Should test small transfer to verify hook is working", async () => {
-      console.log("\n🧪 TESTING SMALL TRANSFER");
-      console.log("═══════════════════════════");
-
-      const marketState = getCurrentNYSEMarketState();
-      console.log(`📊 Current NYSE Status: ${marketState.status}`);
-
-      if (marketState.isOpen) {
-        console.log("✅ Market is open - small transfer should succeed");
-        await performTransferTest(100, "Small transfer during market hours");
-      } else {
-        console.log("🚫 Market is closed - small transfer should be blocked");
-        await expectTransferToFail(100, "Small transfer during closed hours");
-      }
-    });
-  });
-
-  describe("📊 MARKET STATE VALIDATION", () => {
-    it("Should demonstrate comprehensive NYSE compliance", async () => {
-      console.log("\n📊 NYSE TOKEN COMPREHENSIVE VALIDATION");
-      console.log("═══════════════════════════════════════");
-
-      const marketState = getCurrentNYSEMarketState();
-
-      console.log("✅ DEMONSTRATED BEHAVIORS:");
-      console.log(`   📈 Current Status: ${marketState.status}`);
-      console.log(`   🕐 Eastern Time: ${marketState.easternTime}`);
-      console.log(`   📅 Reason: ${marketState.reason}`);
-      console.log(
-        `   🔥 Transfer Hook: ${
-          marketState.isOpen ? "ALLOWING" : "BLOCKING"
-        } transfers`
-      );
-
-      console.log("\n🕐 TIME ZONE & CALENDAR FEATURES:");
-      console.log("   ✅ Proper DST handling (EST/EDT conversion)");
-      console.log("   ✅ Leap year support (February 29 validation)");
-      console.log("   ✅ Holiday calculation (floating holidays like MLK Day)");
-      console.log("   ✅ Accurate weekday determination");
-
-      console.log("\n🏦 TOKEN CHARACTERISTICS:");
-      console.log("   🔹 Uses Token-2022 with Transfer Hook extension");
-      console.log("   🔹 Every transfer calls NYSE validation program");
-      console.log("   🔹 Real-time market hours enforcement");
-      console.log("   🔹 Impossible to bypass market hours restrictions");
-      console.log("   🔹 Works automatically with any DEX/wallet");
-
-      console.log("\n🚀 PRODUCTION READY:");
-      console.log("   ✅ Deploy to mainnet-beta");
-      console.log("   ✅ Create liquidity pools on Raydium/Orca");
-      console.log("   ✅ Automatic NYSE compliance for all trading");
-      console.log("   ✅ Comprehensive error handling and logging");
-
-      // Get final balances
-      const user1Final = await provider.connection.getTokenAccountBalance(
-        user1Account
-      );
-      const user2Final = await provider.connection.getTokenAccountBalance(
-        user2Account
-      );
-
-      console.log("\n💰 FINAL TOKEN BALANCES:");
-      console.log(`   User 1: ${user1Final.value.uiAmount} tokens`);
-      console.log(`   User 2: ${user2Final.value.uiAmount} tokens`);
-
-      expect(true).to.be.true;
-    });
-  });
-
-  // Helper functions
-  async function performTransferTest(amount: number, description: string) {
-    console.log(`🎯 Attempting ${amount} token transfer...`);
-
-    const user1Before = await provider.connection.getTokenAccountBalance(
-      user1Account
+        ),
+        createInitializeMintInstruction(
+          mint.publicKey,
+          DECIMALS,
+          payer.publicKey,
+          null,
+          TOKEN_2022_PROGRAM_ID
+        ),
+      ],
+      [payer, mint]
     );
-    const user2Before = await provider.connection.getTokenAccountBalance(
-      user2Account
+    expect(createMint instanceof FailedTransactionMetadata, "mint creation failed").to.be.false;
+
+    // 2. Initialize the hook's extra-account-meta list.
+    const initMetas = send(
+      [
+        new TransactionInstruction({
+          programId: PROGRAM_ID,
+          keys: [
+            { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+            { pubkey: extraMetas, isSigner: false, isWritable: true },
+            { pubkey: mint.publicKey, isSigner: false, isWritable: false },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+          ],
+          data: anchorDiscriminator("initialize_extra_account_meta_list"),
+        }),
+      ],
+      [payer]
+    );
+    expect(
+      initMetas instanceof FailedTransactionMetadata,
+      `extra account meta init failed: ${
+        initMetas instanceof FailedTransactionMetadata ? initMetas.err().toString() : ""
+      }`
+    ).to.be.false;
+
+    // 3. Token accounts, and supply for the source.
+    source = getAssociatedTokenAddressSync(
+      mint.publicKey,
+      payer.publicKey,
+      false,
+      TOKEN_2022_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    destination = getAssociatedTokenAddressSync(
+      mint.publicKey,
+      recipient.publicKey,
+      false,
+      TOKEN_2022_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
     );
 
-    const transferAmount = amount * 10 ** 9;
-    const transferInstruction =
-      await createTransferCheckedWithTransferHookInstruction(
-        provider.connection,
-        user1Account,
-        nyseMint,
-        user2Account,
-        user1.publicKey,
-        BigInt(transferAmount),
-        9,
-        [],
-        "confirmed",
-        TOKEN_2022_PROGRAM_ID
-      );
-
-    const transaction = new anchor.web3.Transaction().add(transferInstruction);
-    const signature = await provider.sendAndConfirm(transaction, [user1]);
-
-    const user1After = await provider.connection.getTokenAccountBalance(
-      user1Account
-    );
-    const user2After = await provider.connection.getTokenAccountBalance(
-      user2Account
-    );
-
-    console.log(
-      `💰 User 1: ${user1Before.value.uiAmount} → ${user1After.value.uiAmount}`
-    );
-    console.log(
-      `💰 User 2: ${user2Before.value.uiAmount} → ${user2After.value.uiAmount}`
-    );
-    console.log(`📋 Transaction: ${signature}`);
-
-    expect(Number(user1After.value.uiAmount)).to.be.lessThan(
-      Number(user1Before.value.uiAmount)
-    );
-    expect(Number(user2After.value.uiAmount)).to.be.greaterThan(
-      Number(user2Before.value.uiAmount)
-    );
-
-    console.log(`✅ SUCCESS: ${description}`);
-  }
-
-  async function expectTransferToFail(amount: number, description: string) {
-    console.log(`🎯 Attempting ${amount} token transfer (should fail)...`);
-
-    const user1Before = await provider.connection.getTokenAccountBalance(
-      user1Account
-    );
-    const user2Before = await provider.connection.getTokenAccountBalance(
-      user2Account
-    );
-
-    const transferAmount = amount * 10 ** 9;
-
-    try {
-      const transferInstruction =
-        await createTransferCheckedWithTransferHookInstruction(
-          provider.connection,
-          user1Account,
-          nyseMint,
-          user2Account,
-          user1.publicKey,
-          BigInt(transferAmount),
-          9,
+    const setupAccounts = send(
+      [
+        createAssociatedTokenAccountInstruction(
+          payer.publicKey,
+          source,
+          payer.publicKey,
+          mint.publicKey,
+          TOKEN_2022_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        ),
+        createAssociatedTokenAccountInstruction(
+          payer.publicKey,
+          destination,
+          recipient.publicKey,
+          mint.publicKey,
+          TOKEN_2022_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        ),
+        createMintToInstruction(
+          mint.publicKey,
+          source,
+          payer.publicKey,
+          1_000_000_000_000n,
           [],
-          "confirmed",
           TOKEN_2022_PROGRAM_ID
-        );
+        ),
+      ],
+      [payer]
+    );
+    expect(
+      setupAccounts instanceof FailedTransactionMetadata,
+      `account setup failed: ${
+        setupAccounts instanceof FailedTransactionMetadata
+          ? setupAccounts.err().toString()
+          : ""
+      }`
+    ).to.be.false;
+  });
 
-      const transaction = new anchor.web3.Transaction().add(
-        transferInstruction
+  describe("transfers during the regular session", () => {
+    it("allows a mid-session transfer", () => {
+      expectTransferAllowed(T.openRegular);
+    });
+
+    it("allows a transfer at the opening bell (09:30 ET)", () => {
+      expectTransferAllowed(T.openAtBell);
+    });
+
+    it("allows a transfer in the closing minute (15:59 ET)", () => {
+      expectTransferAllowed(T.lastMinute);
+    });
+  });
+
+  describe("transfers outside the session", () => {
+    it("blocks weekends", () => {
+      expectTransferBlocked(T.weekend, ERR.WEEKEND);
+    });
+
+    it("blocks exchange holidays", () => {
+      expectTransferBlocked(T.holidayChristmas, ERR.HOLIDAY);
+    });
+
+    it("blocks pre-market (09:00 ET)", () => {
+      expectTransferBlocked(T.preMarket, ERR.PRE_MARKET);
+    });
+
+    it("blocks after hours (16:30 ET)", () => {
+      expectTransferBlocked(T.afterHours, ERR.AFTER_HOURS);
+    });
+  });
+
+  describe("NYSE half-days are deliberately not enforced", () => {
+    it("still allows trading at 14:00 ET on the Friday after Thanksgiving", () => {
+      expectTransferAllowed(T.nyseHalfDayAfternoon);
+    });
+
+    it("still allows trading at 15:55 ET on Christmas Eve", () => {
+      expectTransferAllowed(T.nyseHalfDayClose);
+    });
+  });
+
+  describe("regressions from the 365-day-year calendar bug", () => {
+    it("allows trading on 2026-12-11, which the old code blocked as Christmas", () => {
+      expectTransferAllowed(T.regressionDec11);
+    });
+
+    it("allows 09:45 ET on 2026-10-20, when the old DST check shifted the window", () => {
+      expectTransferAllowed(T.regressionOct20);
+    });
+  });
+
+  // What the hook does NOT gate. Token-2022 only invokes a transfer hook from
+  // Transfer/TransferChecked, so any other operation on the mint is unaffected
+  // by market hours. These tests document that boundary rather than assert a
+  // desired behaviour -- if a future Token-2022 version changes it, we want to
+  // know.
+  describe("operations the hook does not gate", () => {
+    it("allows burning while the market is closed", () => {
+      setClock(T.weekend.ts);
+      const before = rawBalance(source);
+      const result = send(
+        [
+          createBurnInstruction(
+            source,
+            mint.publicKey,
+            payer.publicKey,
+            500n,
+            [],
+            TOKEN_2022_PROGRAM_ID
+          ),
+        ],
+        [payer]
       );
-      const signature = await provider.sendAndConfirm(transaction, [user1]);
+      expect(result instanceof FailedTransactionMetadata, "burn should not be gated").to.be.false;
+      expect(before - rawBalance(source)).to.equal(500n);
+    });
 
-      console.log(`⚠️  UNEXPECTED: Transfer succeeded: ${signature}`);
-      console.log(
-        "❌ This means the market should be OPEN but our logic detected CLOSED"
+    it("allows minting while the market is closed", () => {
+      setClock(T.weekend.ts);
+      const before = rawBalance(source);
+      const result = send(
+        [
+          createMintToInstruction(
+            mint.publicKey,
+            source,
+            payer.publicKey,
+            500n,
+            [],
+            TOKEN_2022_PROGRAM_ID
+          ),
+        ],
+        [payer]
       );
-      throw new Error(`${description} but it succeeded!`);
-    } catch (error) {
-      if (error.message.includes("succeeded")) {
-        throw error; // Re-throw if it's our logic error
-      }
+      expect(result instanceof FailedTransactionMetadata, "mint should not be gated").to.be.false;
+      expect(rawBalance(source) - before).to.equal(500n);
+    });
 
-      console.log("🚫 BLOCKED: Transfer failed as expected!");
-      console.log(`📋 Error: ${error.message}`);
-
-      // Verify balances didn't change
-      const user1After = await provider.connection.getTokenAccountBalance(
-        user1Account
+    it("allows approving a delegate while the market is closed", () => {
+      setClock(T.weekend.ts);
+      const result = send(
+        [
+          createApproveInstruction(
+            source,
+            recipient.publicKey,
+            payer.publicKey,
+            1_000n,
+            [],
+            TOKEN_2022_PROGRAM_ID
+          ),
+        ],
+        [payer]
       );
-      const user2After = await provider.connection.getTokenAccountBalance(
-        user2Account
+      expect(result instanceof FailedTransactionMetadata, "approve should not be gated").to.be
+        .false;
+    });
+  });
+
+  describe("hook cannot be invoked outside a transfer", () => {
+    it("rejects a direct Execute call", () => {
+      setClock(T.openRegular.ts);
+      // spl-transfer-hook-interface Execute discriminator, then a u64 amount.
+      const data = Buffer.concat([
+        createHash("sha256")
+          .update("spl-transfer-hook-interface:execute")
+          .digest()
+          .subarray(0, 8),
+        (() => {
+          const b = Buffer.alloc(8);
+          b.writeBigUInt64LE(1_000n);
+          return b;
+        })(),
+      ]);
+      const result = send(
+        [
+          new TransactionInstruction({
+            programId: PROGRAM_ID,
+            keys: [
+              { pubkey: source, isSigner: false, isWritable: false },
+              { pubkey: mint.publicKey, isSigner: false, isWritable: false },
+              { pubkey: destination, isSigner: false, isWritable: false },
+              { pubkey: payer.publicKey, isSigner: false, isWritable: false },
+              { pubkey: extraMetas, isSigner: false, isWritable: false },
+            ],
+            data,
+          }),
+        ],
+        [payer]
       );
-
-      expect(user1After.value.uiAmount).to.equal(user1Before.value.uiAmount);
-      expect(user2After.value.uiAmount).to.equal(user2Before.value.uiAmount);
-
-      console.log(`✅ SUCCESS: ${description}`);
-    }
-  }
+      expect(result instanceof FailedTransactionMetadata, "direct call should fail").to.be.true;
+      expectCustomError(
+        result as FailedTransactionMetadata,
+        ERR.NOT_TRANSFERRING,
+        "direct Execute call"
+      );
+    });
+  });
 });
 
-// GET CURRENT NYSE MARKET STATE (simplified to match Rust implementation)
-function getCurrentNYSEMarketState(): {
-  status: string;
-  isOpen: boolean;
-  reason: string;
-  easternTime: string;
-} {
-  const now = new Date();
-  const easternTime = convertUTCToEasternSimple(now);
+/**
+ * The launch configuration that actually makes the token non-tradeable outside
+ * market hours with a fixed supply.
+ *
+ * Blocking transfers is only half of it: a mint whose authorities are still live
+ * can be inflated, or have its hook repointed at a no-op program. These tests
+ * build a mint the way it should be launched and assert that those doors are
+ * shut permanently.
+ */
+describe("launch configuration: fixed supply, immutable hook and metadata", () => {
+  const SUPPLY = 1_000_000_000_000_000n;
+  const NAME = "STONKS";
+  const SYMBOL = "STONKS";
+  const URI = "https://example.com/stonks.json";
 
-  const easternTimeString = `${easternTime.year}-${easternTime.month
-    .toString()
-    .padStart(2, "0")}-${easternTime.day
-    .toString()
-    .padStart(2, "0")} ${easternTime.hour
-    .toString()
-    .padStart(2, "0")}:${easternTime.minute
-    .toString()
-    .padStart(2, "0")}:${easternTime.second.toString().padStart(2, "0")} ${
-    easternTime.isDST ? "EDT" : "EST"
-  } (Weekday: ${easternTime.weekday})`;
+  let svm: LiteSVM;
+  let payer: Keypair;
+  let holder: Keypair;
+  let mint: Keypair;
+  let extraMetas: PublicKey;
+  let source: PublicKey;
+  let destination: PublicKey;
 
-  console.log(`🕐 TypeScript calculated Eastern Time: ${easternTimeString}`);
+  function setClock(unixTimestamp: bigint) {
+    const clock = svm.getClock();
+    clock.unixTimestamp = unixTimestamp;
+    svm.setClock(clock);
+  }
 
-  // 1. FIRST: Check weekend (Sunday = 0, Saturday = 6)
-  if (easternTime.weekday === 0 || easternTime.weekday === 6) {
-    console.log(`🚫 WEEKEND DETECTED: Weekday = ${easternTime.weekday}`);
-    return {
-      status: "WEEKEND",
-      isOpen: false,
-      reason: "Weekend",
-      easternTime: easternTimeString,
+  function send(ixs: TransactionInstruction[], signers: Keypair[]) {
+    svm.expireBlockhash();
+    const tx = new Transaction();
+    tx.recentBlockhash = svm.latestBlockhash();
+    tx.feePayer = payer.publicKey;
+    ixs.forEach((ix) => tx.add(ix));
+    tx.sign(...signers);
+    return svm.sendTransaction(tx);
+  }
+
+  function rawBalance(account: PublicKey): bigint {
+    const info = svm.getAccount(account);
+    if (!info) throw new Error("missing token account");
+    return Buffer.from(info.data).readBigUInt64LE(64);
+  }
+
+  function transferIx(amount: bigint): TransactionInstruction {
+    const ix = createTransferCheckedInstruction(
+      source,
+      mint.publicKey,
+      destination,
+      payer.publicKey,
+      amount,
+      DECIMALS,
+      [],
+      TOKEN_2022_PROGRAM_ID
+    );
+    ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
+    ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+    return ix;
+  }
+
+  function mintSupply(): bigint {
+    const info = svm.getAccount(mint.publicKey);
+    if (!info) throw new Error("missing mint");
+    // Mint layout: supply is a u64 at offset 36.
+    return Buffer.from(info.data).readBigUInt64LE(36);
+  }
+
+  before(() => {
+    svm = new LiteSVM().withBuiltins().withSplPrograms().withSysvars();
+    svm.addProgramFromFile(PROGRAM_ID, SO_PATH);
+
+    payer = Keypair.generate();
+    holder = Keypair.generate();
+    mint = Keypair.generate();
+    svm.airdrop(payer.publicKey, 100_000_000_000n);
+    setClock(T.openRegular.ts);
+
+    [extraMetas] = PublicKey.findProgramAddressSync(
+      [Buffer.from("extra-account-metas"), mint.publicKey.toBuffer()],
+      PROGRAM_ID
+    );
+
+    const metadata: TokenMetadata = {
+      updateAuthority: payer.publicKey,
+      mint: mint.publicKey,
+      name: NAME,
+      symbol: SYMBOL,
+      uri: URI,
+      additionalMetadata: [],
     };
-  }
+    // The account is sized for the fixed extensions but funded for the
+    // variable-length metadata too, which InitializeTokenMetadata reallocs into.
+    const mintLen = getMintLen([ExtensionType.TransferHook, ExtensionType.MetadataPointer]);
+    const metadataLen = TYPE_SIZE + LENGTH_SIZE + pack(metadata).length;
+    const created = send(
+      [
+        SystemProgram.createAccount({
+          fromPubkey: payer.publicKey,
+          newAccountPubkey: mint.publicKey,
+          space: mintLen,
+          lamports: Number(svm.minimumBalanceForRentExemption(BigInt(mintLen + metadataLen))),
+          programId: TOKEN_2022_PROGRAM_ID,
+        }),
+        createInitializeMetadataPointerInstruction(
+          mint.publicKey,
+          payer.publicKey,
+          mint.publicKey,
+          TOKEN_2022_PROGRAM_ID
+        ),
+        createInitializeTransferHookInstruction(
+          mint.publicKey,
+          payer.publicKey,
+          PROGRAM_ID,
+          TOKEN_2022_PROGRAM_ID
+        ),
+        // Freeze authority is null from the start: nothing should be able to
+        // freeze or thaw individual holders.
+        createInitializeMintInstruction(
+          mint.publicKey,
+          DECIMALS,
+          payer.publicKey,
+          null,
+          TOKEN_2022_PROGRAM_ID
+        ),
+        createInitializeMetadataInstruction({
+          programId: TOKEN_2022_PROGRAM_ID,
+          metadata: mint.publicKey,
+          updateAuthority: payer.publicKey,
+          mint: mint.publicKey,
+          mintAuthority: payer.publicKey,
+          name: NAME,
+          symbol: SYMBOL,
+          uri: URI,
+        }),
+      ],
+      [payer, mint]
+    );
+    expect(
+      created instanceof FailedTransactionMetadata,
+      `mint creation failed: ${
+        created instanceof FailedTransactionMetadata ? created.err().toString() : ""
+      }`
+    ).to.be.false;
 
-  // 2. SECOND: Check major holidays (simplified)
-  if (
-    isNYSEHolidaySimple(easternTime.year, easternTime.month, easternTime.day)
-  ) {
-    return {
-      status: "HOLIDAY",
-      isOpen: false,
-      reason: "NYSE Holiday",
-      easternTime: easternTimeString,
-    };
-  }
+    const initMetas = send(
+      [
+        new TransactionInstruction({
+          programId: PROGRAM_ID,
+          keys: [
+            { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+            { pubkey: extraMetas, isSigner: false, isWritable: true },
+            { pubkey: mint.publicKey, isSigner: false, isWritable: false },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+          ],
+          data: anchorDiscriminator("initialize_extra_account_meta_list"),
+        }),
+      ],
+      [payer]
+    );
+    expect(initMetas instanceof FailedTransactionMetadata, "meta init failed").to.be.false;
 
-  // 3. THIRD: Check market hours (9:30 AM - 4:00 PM ET)
-  const currentMinutes = easternTime.hour * 60 + easternTime.minute;
-  const marketOpenMinutes = 9 * 60 + 30; // 9:30 AM
-  const marketCloseMinutes = 16 * 60; // 4:00 PM
+    source = getAssociatedTokenAddressSync(
+      mint.publicKey, payer.publicKey, false, TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    destination = getAssociatedTokenAddressSync(
+      mint.publicKey, holder.publicKey, false, TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+    );
 
-  if (
-    currentMinutes >= marketOpenMinutes &&
-    currentMinutes < marketCloseMinutes
-  ) {
-    return {
-      status: "OPEN",
-      isOpen: true,
-      reason: "Regular Trading Hours",
-      easternTime: easternTimeString,
-    };
-  } else {
-    const timeStatus =
-      currentMinutes < marketOpenMinutes ? "Pre-Market" : "After-Market";
-    return {
-      status: "AFTER_HOURS",
-      isOpen: false,
-      reason: `${timeStatus} (outside 9:30 AM - 4:00 PM ET)`,
-      easternTime: easternTimeString,
-    };
-  }
-}
+    // Mint the entire fixed supply, then close the door behind us.
+    const minted = send(
+      [
+        createAssociatedTokenAccountInstruction(
+          payer.publicKey, source, payer.publicKey, mint.publicKey,
+          TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+        ),
+        createAssociatedTokenAccountInstruction(
+          payer.publicKey, destination, holder.publicKey, mint.publicKey,
+          TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+        ),
+        createMintToInstruction(
+          mint.publicKey, source, payer.publicKey, SUPPLY, [], TOKEN_2022_PROGRAM_ID
+        ),
+        // 1. Name, symbol and image can never be changed.
+        createUpdateMetadataAuthorityInstruction({
+          programId: TOKEN_2022_PROGRAM_ID,
+          metadata: mint.publicKey,
+          oldAuthority: payer.publicKey,
+          newAuthority: null,
+        }),
+        // 2. No more tokens, ever.
+        createSetAuthorityInstruction(
+          mint.publicKey, payer.publicKey, AuthorityType.MintTokens, null, [],
+          TOKEN_2022_PROGRAM_ID
+        ),
+        // 3. The hook can never be repointed at a different program.
+        createSetAuthorityInstruction(
+          mint.publicKey, payer.publicKey, AuthorityType.TransferHookProgramId, null, [],
+          TOKEN_2022_PROGRAM_ID
+        ),
+      ],
+      [payer]
+    );
+    expect(
+      minted instanceof FailedTransactionMetadata,
+      `supply mint + authority revocation failed: ${
+        minted instanceof FailedTransactionMetadata ? minted.err().toString() : ""
+      }`
+    ).to.be.false;
+  });
 
-interface EasternTime {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-  weekday: number; // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
-  isDST: boolean;
-}
+  // Pins how a revoked authority decodes, which is what scripts/launch-token.ts
+  // checks after a real launch.
+  it("reports every authority as revoked", () => {
+    const info = svm.getAccount(mint.publicKey);
+    if (!info) throw new Error("missing mint");
+    const decoded = unpackMint(
+      mint.publicKey,
+      {
+        ...info,
+        data: Buffer.from(info.data),
+        owner: new PublicKey(info.owner),
+      } as any,
+      TOKEN_2022_PROGRAM_ID
+    );
+    expect(decoded.mintAuthority, "mint authority").to.be.null;
+    expect(decoded.freezeAuthority, "freeze authority").to.be.null;
 
-// Simplified Eastern Time conversion (matches Rust implementation)
-function convertUTCToEasternSimple(utcDate: Date): EasternTime {
-  const utcTimestamp = Math.floor(utcDate.getTime() / 1000);
+    const hook = getTransferHook(decoded);
+    expect(hook, "transfer hook extension present").to.not.be.null;
+    expect(hook!.programId.equals(PROGRAM_ID), "hook still points at our program").to.be.true;
+    // A revoked hook authority is the all-zeros pubkey, not null.
+    expect(
+      hook!.authority === null || hook!.authority.equals(PublicKey.default),
+      `hook authority should be revoked, got ${hook!.authority?.toBase58()}`
+    ).to.be.true;
+  });
 
-  // Determine DST status (simplified)
-  const isDST = isDaylightSavingTimeSimple(utcTimestamp);
+  // This is what wallets, explorers and DEX aggregators read off the mint.
+  it("exposes name, symbol and uri on-chain", () => {
+    const info = svm.getAccount(mint.publicKey);
+    if (!info) throw new Error("missing mint");
+    const decoded = unpackMint(
+      mint.publicKey,
+      { ...info, data: Buffer.from(info.data), owner: new PublicKey(info.owner) } as any,
+      TOKEN_2022_PROGRAM_ID
+    );
+    const raw = getExtensionData(ExtensionType.TokenMetadata, decoded.tlvData);
+    expect(raw, "TokenMetadata extension present on the mint").to.not.be.null;
 
-  // Apply Eastern Time offset
-  const easternOffsetSeconds = isDST ? -4 * 3600 : -5 * 3600;
-  const easternTimestamp = utcTimestamp + easternOffsetSeconds;
+    const meta = unpackMetadata(raw!);
+    expect(meta.name).to.equal(NAME);
+    expect(meta.symbol).to.equal(SYMBOL);
+    expect(meta.uri).to.equal(URI);
+    expect(meta.mint.equals(mint.publicKey), "metadata points at this mint").to.be.true;
+  });
 
-  // Convert to date/time components
-  const daysSinceEpoch = Math.floor(easternTimestamp / 86400);
-  let secondsInDay = easternTimestamp % 86400;
+  it("cannot change the name, symbol or uri", () => {
+    setClock(T.openRegular.ts);
+    const result = send(
+      [
+        createUpdateMetadataAuthorityInstruction({
+          programId: TOKEN_2022_PROGRAM_ID,
+          metadata: mint.publicKey,
+          oldAuthority: payer.publicKey,
+          newAuthority: payer.publicKey,
+        }),
+      ],
+      [payer]
+    );
+    expect(result instanceof FailedTransactionMetadata, "metadata should be immutable").to.be.true;
+  });
 
-  // Handle negative seconds (wrap to previous day)
-  if (secondsInDay < 0) {
-    secondsInDay += 86400;
-  }
+  it("has the full supply minted", () => {
+    expect(mintSupply()).to.equal(SUPPLY);
+    expect(rawBalance(source)).to.equal(SUPPLY);
+  });
 
-  // Calculate weekday (0 = Sunday, 1 = Monday, ..., 6 = Saturday)
-  // January 1, 1970 was a Thursday (4)
-  const weekday = (((daysSinceEpoch + 4) % 7) + 7) % 7;
+  it("cannot mint more, even during market hours", () => {
+    setClock(T.openRegular.ts);
+    const before = mintSupply();
+    const result = send(
+      [
+        createMintToInstruction(
+          mint.publicKey, source, payer.publicKey, 1n, [], TOKEN_2022_PROGRAM_ID
+        ),
+      ],
+      [payer]
+    );
+    expect(result instanceof FailedTransactionMetadata, "minting should be impossible").to.be.true;
+    expect(mintSupply()).to.equal(before);
+  });
 
-  // Calculate time components
-  const hour = Math.floor(secondsInDay / 3600);
-  const minute = Math.floor((secondsInDay % 3600) / 60);
-  const second = secondsInDay % 60;
+  it("cannot repoint the transfer hook at another program", () => {
+    setClock(T.openRegular.ts);
+    const result = send(
+      [
+        createUpdateTransferHookInstruction(
+          mint.publicKey,
+          payer.publicKey,
+          SystemProgram.programId, // a no-op target
+          [],
+          TOKEN_2022_PROGRAM_ID
+        ),
+      ],
+      [payer]
+    );
+    expect(result instanceof FailedTransactionMetadata, "hook should be immutable").to.be.true;
+  });
 
-  // Calculate date components (simplified)
-  const { year, month, day } = daysToDateSimple(daysSinceEpoch);
+  it("cannot freeze a holder's account", () => {
+    setClock(T.openRegular.ts);
+    const result = send(
+      [
+        createSetAuthorityInstruction(
+          mint.publicKey, payer.publicKey, AuthorityType.FreezeAccount,
+          payer.publicKey, [], TOKEN_2022_PROGRAM_ID
+        ),
+      ],
+      [payer]
+    );
+    expect(result instanceof FailedTransactionMetadata, "freeze authority should be dead").to.be
+      .true;
+  });
 
-  return {
-    year,
-    month,
-    day,
-    hour,
-    minute,
-    second,
-    weekday,
-    isDST,
-  };
-}
+  it("still blocks transfers outside market hours", () => {
+    setClock(T.weekend.ts);
+    const before = rawBalance(destination);
+    const result = send([transferIx(1_000n)], [payer]);
+    expect(result instanceof FailedTransactionMetadata, "weekend transfer should fail").to.be.true;
+    expect(rawBalance(destination)).to.equal(before);
+  });
 
-// Simplified DST check (matches Rust)
-function isDaylightSavingTimeSimple(utcTimestamp: number): boolean {
-  const daysSinceEpoch = Math.floor(utcTimestamp / 86400);
-  const approxYear = 1970 + Math.floor(daysSinceEpoch / 365);
-  const daysInYear = daysSinceEpoch % 365;
+  it("allows transfers during market hours", () => {
+    setClock(T.openRegular.ts);
+    const before = rawBalance(destination);
+    const result = send([transferIx(1_000n)], [payer]);
+    expect(result instanceof FailedTransactionMetadata, "session transfer should succeed").to.be
+      .false;
+    expect(rawBalance(destination) - before).to.equal(1_000n);
+  });
 
-  // DST roughly: March (day 60) to November (day 305)
-  if (approxYear >= 2007) {
-    // Post-2007 DST rules: 2nd Sunday in March to 1st Sunday in November
-    return daysInYear >= 70 && daysInYear <= 305;
-  } else {
-    // Pre-2007 DST rules: 1st Sunday in April to last Sunday in October
-    return daysInYear >= 90 && daysInYear <= 300;
-  }
-}
-
-// Simplified date calculation (matches Rust)
-function daysToDateSimple(daysSinceEpoch: number): {
-  year: number;
-  month: number;
-  day: number;
-} {
-  // Very simplified - assumes average year length
-  const approxYear = 1970 + Math.floor(daysSinceEpoch / 365);
-  const remainingDays = daysSinceEpoch % 365;
-
-  // Simplified month/day calculation
-  const months = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  let month = 1;
-  let daysLeft = remainingDays;
-
-  for (const daysInMonth of months) {
-    if (daysLeft < daysInMonth) {
-      break;
-    }
-    daysLeft -= daysInMonth;
-    month += 1;
-  }
-
-  const day = Math.max(daysLeft + 1, 1);
-
-  return { year: approxYear, month, day };
-}
-
-// Simplified NYSE holiday check (matches Rust)
-function isNYSEHolidaySimple(
-  year: number,
-  month: number,
-  day: number
-): boolean {
-  switch (month) {
-    case 1:
-      return day === 1; // New Year's Day
-    case 7:
-      return day === 4; // Independence Day
-    case 12:
-      return day === 25; // Christmas Day
-    default:
-      return false;
-  }
-}
-
-// Keep old functions for backward compatibility but not used in main logic
-function convertUTCToEastern(utcDate: Date): EasternTime {
-  // This is the old complex version - keeping for reference but not using
-  return convertUTCToEasternSimple(utcDate);
-}
+  it("supply stays constant across all of it", () => {
+    expect(mintSupply()).to.equal(SUPPLY);
+  });
+});
