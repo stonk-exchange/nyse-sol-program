@@ -270,6 +270,9 @@ transfer fail, so venues must opt into supporting one — and most require it to
 TokenBadge is a PDA that Orca controls, so listing is a permissioned step —
 request review via the Support function in the Orca app wallet menu, or via
 Discord/Telegram. Review is case by case.
+[`docs/orca-token-badge-request.md`](docs/orca-token-badge-request.md) is a
+prepared request covering the hook's behaviour, the verification against Orca's
+own program, the compute-budget measurements and the open questions.
 
 Build Orca instructions with the legacy
 [`@orca-so/whirlpools-sdk`](https://www.npmjs.com/package/@orca-so/whirlpools-sdk),
