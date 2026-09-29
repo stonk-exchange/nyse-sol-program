@@ -138,13 +138,40 @@ hook resolves zero extra accounts, so that is just the hook program ID followed
 by the validation-state PDA — which is what
 `createTransferCheckedWithTransferHookInstruction` produces.
 
-## Limitations
+## Venue support
 
-**Venue support is the binding constraint.** A transfer hook can make a transfer
-fail, so AMMs and routers have to opt into supporting arbitrary hook programs;
-many do not. Confirm that the venues you care about will list a hooked
-Token-2022 mint *before* building on this. This is a property of the ecosystem,
-not something the hook can fix.
+This is the binding constraint, not the hook. A transfer hook can make a
+transfer fail, so venues have to opt into supporting one — and most require it
+to be *revoked*, which defeats the point.
+
+```bash
+npx ts-node scripts/check-mint-readiness.ts --cluster devnet --mint <MINT>
+```
+
+reads a mint and reports it against each venue's rules:
+
+| Venue | Active transfer hook | Source |
+| --- | --- | --- |
+| **Orca Whirlpools** | **Supported, permanently — TokenBadge required** | `is_supported_token_mint` in `programs/whirlpool/src/util/v2/token.rs` returns `false` for `TransferHook` unless a TokenBadge is initialized |
+| Meteora DBC | Runs during the bonding curve, then **revoked on completion** | "DBC revokes the transfer-hook program id and transfer-hook authority from the base mint when the curve completes" |
+| Meteora DAMM v2 | Effectively no | `TransferHook` permissionless "only when both the hook program ID and hook authority are unset"; "DAMM v2 does not provide a general transfer-hook remaining-account surface for swaps, liquidity, fees, or rewards" |
+| Meteora DLMM | Badge required, forwarding undocumented | `TransferHook`, "only when both the hook program and hook authority are revoked" |
+
+**Orca is currently the only venue that keeps the hook alive permanently.** A
+TokenBadge is a PDA that Orca controls, so listing is a permissioned step.
+
+Build Orca instructions with the legacy [`@orca-so/whirlpools-sdk`](https://www.npmjs.com/package/@orca-so/whirlpools-sdk),
+which wires hook accounts via `RemainingAccountsBuilder` +
+`TokenExtensionUtil.getExtraAccountMetasForTransferHook`. The newer
+`@orca-so/whirlpools` does not attach them on V2 instructions yet and fails with
+`0x17a2 NoExtraAccountsForTransferHook` — see
+[orca-so/whirlpools#1372](https://github.com/orca-so/whirlpools/issues/1372).
+
+**Meteora DBC cannot host a permanent restriction.** Completion is triggered by
+the migration quote threshold and there is no option to disable it — the
+migration options are DAMM v1/v2 only. Setting an unreachable threshold makes
+graduation economically unlikely, not impossible, and if it ever completes the
+hook is revoked permanently.
 
 **Only transfers are gated.** Token-2022 invokes a transfer hook from
 `Transfer`/`TransferChecked` and nowhere else. Burning, minting, and approving a

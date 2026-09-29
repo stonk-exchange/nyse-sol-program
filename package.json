@@ -7,7 +7,8 @@
     "gen:table": "python3 scripts/gen_market_table.py",
     "check:tzdata": "python3 scripts/gen_market_table.py --check",
     "lint": "prettier '*/**/*{.js,.ts}' --check",
-    "lint:fix": "prettier '*/**/*{.js,.ts}' -w"
+    "lint:fix": "prettier '*/**/*{.js,.ts}' -w",
+    "check:mint": "ts-node scripts/check-mint-readiness.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",
