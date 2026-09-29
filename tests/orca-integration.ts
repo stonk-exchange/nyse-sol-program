@@ -39,6 +39,8 @@ const OPEN = 1_790_607_600n; // 2026-09-28 Mon 11:00 ET
 const AFTER_HOURS = 1_790_627_400n; // 2026-09-28 Mon 16:30 ET
 const WEEKEND = 1_791_039_600n; // 2026-10-03 Sat 11:00 ET
 const REOPEN = 1_791_212_400n; // 2026-10-05 Mon 11:00 ET
+const LP_WEEKEND = 1_791_644_400n; // 2026-10-10 Sat 11:00 ET
+const LP_REOPEN = 1_791_817_200n; // 2026-10-12 Mon 11:00 ET
 
 /** Our NyseError codes, and Orca's badge rejection. */
 const ERR = { WEEKEND: 6000, AFTER_HOURS: 6003, UNSUPPORTED_TOKEN_MINT: 6047 };
@@ -66,6 +68,8 @@ const haveFixtures = fs.existsSync(ORCA_SO) && fs.existsSync(ORCA_CFG) && fs.exi
   let badgeA: { publicKey: PublicKey; bump: number };
   let badgeB: PublicKey;
   let feeTierKey: PublicKey;
+  let position: PublicKey;
+  let positionTokenAccount: PublicKey;
 
   const setClock = (ts: bigint) => {
     const c = svm.getClock();
@@ -281,7 +285,8 @@ const haveFixtures = fs.existsSync(ORCA_SO) && fs.existsSync(ORCA_CFG) && fs.exi
 
       const positionMint = Keypair.generate();
       const positionPda = PDAUtil.getPosition(ORCA_WHIRLPOOL_PROGRAM_ID, positionMint.publicKey);
-      const positionTokenAccount = getAssociatedTokenAddressSync(
+      position = positionPda.publicKey;
+      positionTokenAccount = getAssociatedTokenAddressSync(
         positionMint.publicKey, payer.publicKey, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
       );
       ok(WhirlpoolIx.openPositionIx(ctx.program, {
@@ -339,4 +344,61 @@ const haveFixtures = fs.existsSync(ORCA_SO) && fs.existsSync(ORCA_CFG) && fs.exi
       expect(tokenBalance(ataB) > before, "received quote tokens").to.be.true;
     });
   });
+
+  // Liquidity is moved by transfers, so LPs are subject to the same hours as
+  // traders. This is the constraint an LP most needs to understand.
+  describe("liquidity provision respects NYSE hours", () => {
+    function decreaseIxs(liquidity: number) {
+      return WhirlpoolIx.decreaseLiquidityV2Ix(ctx.program, {
+        liquidityAmount: new anchor.BN(liquidity),
+        tokenMinA: new anchor.BN(0), tokenMinB: new anchor.BN(0),
+        whirlpool: pool, positionAuthority: payer.publicKey,
+        position, positionTokenAccount,
+        tokenMintA: hookedMint.publicKey, tokenMintB: quoteMint.publicKey,
+        tokenOwnerAccountA: ataA, tokenOwnerAccountB: ataB,
+        tokenVaultA: vaultA.publicKey, tokenVaultB: vaultB.publicKey,
+        tokenProgramA: TOKEN_2022_PROGRAM_ID, tokenProgramB: TOKEN_PROGRAM_ID,
+        tokenTransferHookAccountsA: hookAccounts,
+        tickArrayLower: PDAUtil.getTickArray(ORCA_WHIRLPOOL_PROGRAM_ID, pool, -TICKS_PER_ARRAY).publicKey,
+        tickArrayUpper: PDAUtil.getTickArray(ORCA_WHIRLPOOL_PROGRAM_ID, pool, 0).publicKey,
+      }).instructions;
+    }
+
+    function collectFeesIxs() {
+      return WhirlpoolIx.collectFeesV2Ix(ctx.program, {
+        whirlpool: pool, positionAuthority: payer.publicKey,
+        position, positionTokenAccount,
+        tokenMintA: hookedMint.publicKey, tokenMintB: quoteMint.publicKey,
+        tokenOwnerAccountA: ataA, tokenOwnerAccountB: ataB,
+        tokenVaultA: vaultA.publicKey, tokenVaultB: vaultB.publicKey,
+        tokenProgramA: TOKEN_2022_PROGRAM_ID, tokenProgramB: TOKEN_PROGRAM_ID,
+        tokenTransferHookAccountsA: hookAccounts,
+      }).instructions;
+    }
+
+    it("blocks an LP from withdrawing outside market hours", () => {
+      setClock(LP_WEEKEND);
+      const before = tokenBalance(ataA);
+      expectCustomError(send(decreaseIxs(1_000_000), []), ERR.WEEKEND, "decreaseLiquidityV2 on Saturday");
+      expect(tokenBalance(ataA), "no tokens withdrawn").to.equal(before);
+    });
+
+    it("blocks an LP from collecting fees outside market hours", () => {
+      setClock(LP_WEEKEND);
+      expectCustomError(send(collectFeesIxs(), []), ERR.WEEKEND, "collectFeesV2 on Saturday");
+    });
+
+    it("allows an LP to withdraw once the market reopens", () => {
+      setClock(LP_REOPEN);
+      const before = tokenBalance(ataA);
+      ok(decreaseIxs(1_000_000), [], "decreaseLiquidityV2 in session");
+      expect(tokenBalance(ataA) > before, "tokens returned to the LP").to.be.true;
+    });
+
+    it("allows an LP to collect fees once the market reopens", () => {
+      setClock(LP_REOPEN);
+      ok(collectFeesIxs(), [], "collectFeesV2 in session");
+    });
+  });
+
 });

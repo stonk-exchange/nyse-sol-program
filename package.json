@@ -11,7 +11,9 @@
     "check:mint": "ts-node scripts/check-mint-readiness.ts",
     "test:orca": "anchor build && ts-mocha -p ./tsconfig.json -t 1000000 'tests/orca-integration.ts'",
     "fetch:orca": "./scripts/fetch-orca-fixtures.sh",
-    "bench": "anchor build && ts-node scripts/bench-compute.ts"
+    "bench": "anchor build && ts-node scripts/bench-compute.ts",
+    "verify:validator": "ts-node scripts/verify-on-validator.ts",
+    "drift": "ts-node scripts/measure-clock-drift.ts"
   },
   "dependencies": {
     "@metaplex-foundation/mpl-token-metadata": "^3.4.0",

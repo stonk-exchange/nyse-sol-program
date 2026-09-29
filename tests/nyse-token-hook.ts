@@ -26,6 +26,7 @@ import {
   createMintToInstruction,
   createBurnInstruction,
   createApproveInstruction,
+  createRevokeInstruction,
   createSetAuthorityInstruction,
   createUpdateTransferHookInstruction,
   AuthorityType,
@@ -436,6 +437,132 @@ describe("NYSE transfer hook", () => {
       );
       expect(result instanceof FailedTransactionMetadata, "approve should not be gated").to.be
         .false;
+    });
+  });
+
+  // The source_token constraint used to be `token::authority = owner`, which
+  // broke delegated transfers because Token-2022 passes the transfer AUTHORITY
+  // in that position, not the account owner. These pin the fix.
+  describe("delegated transfers", () => {
+    let delegate: Keypair;
+
+    before(() => {
+      delegate = Keypair.generate();
+      svm.airdrop(delegate.publicKey, 1_000_000_000n);
+      setClock(T.openRegular.ts);
+      const approve = send(
+        [
+          createApproveInstruction(
+            source, delegate.publicKey, payer.publicKey, 1_000_000n, [], TOKEN_2022_PROGRAM_ID
+          ),
+        ],
+        [payer]
+      );
+      expect(approve instanceof FailedTransactionMetadata, "approve failed").to.be.false;
+    });
+
+    function delegatedTransfer(amount: bigint) {
+      const ix = createTransferCheckedInstruction(
+        source, mint.publicKey, destination, delegate.publicKey, amount, DECIMALS, [], TOKEN_2022_PROGRAM_ID
+      );
+      ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
+      ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+      svm.expireBlockhash();
+      const tx = new Transaction();
+      tx.recentBlockhash = svm.latestBlockhash();
+      tx.feePayer = payer.publicKey;
+      tx.add(ix);
+      tx.sign(payer, delegate);
+      return svm.sendTransaction(tx);
+    }
+
+    it("allows a delegate to transfer during market hours", () => {
+      setClock(T.openRegular.ts);
+      const before = rawBalance(destination);
+      const r = delegatedTransfer(1_000n);
+      expect(
+        r instanceof FailedTransactionMetadata,
+        `delegated transfer should succeed, got ${
+          r instanceof FailedTransactionMetadata ? r.err().toString() : ""
+        }`
+      ).to.be.false;
+      expect(rawBalance(destination) - before).to.equal(1_000n);
+    });
+
+    it("blocks a delegate outside market hours", () => {
+      setClock(T.weekend.ts);
+      const before = rawBalance(destination);
+      expectCustomError(delegatedTransfer(1_000n) as FailedTransactionMetadata, ERR.WEEKEND, "delegated weekend transfer");
+      expect(rawBalance(destination)).to.equal(before);
+    });
+  });
+
+  // The session boundaries are inclusive at the open and exclusive at the
+  // close, to the second.
+  describe("session boundaries, to the second", () => {
+    const cases: [string, bigint, number | null][] = [
+      ["09:29:59 ET", 1_790_602_199n, ERR.PRE_MARKET],
+      ["09:30:00 ET", 1_790_602_200n, null],
+      ["15:59:59 ET", 1_790_625_599n, null],
+      ["16:00:00 ET", 1_790_625_600n, ERR.AFTER_HOURS],
+    ];
+
+    for (const [label, ts, code] of cases) {
+      it(`${label} is ${code === null ? "open" : "closed"}`, () => {
+        setClock(ts);
+        const before = rawBalance(destination);
+        const r = send([transferIx(1_000n)], [payer]);
+        if (code === null) {
+          expect(
+            r instanceof FailedTransactionMetadata,
+            `${label}: expected open, got ${
+              r instanceof FailedTransactionMetadata ? r.err().toString() : ""
+            }`
+          ).to.be.false;
+          expect(rawBalance(destination) - before).to.equal(1_000n);
+        } else {
+          expectCustomError(r as FailedTransactionMetadata, code, label);
+          expect(rawBalance(destination)).to.equal(before);
+        }
+      });
+    }
+  });
+
+  describe("degenerate transfers", () => {
+    it("blocks a zero-amount transfer outside market hours", () => {
+      setClock(T.weekend.ts);
+      const ix = createTransferCheckedInstruction(
+        source, mint.publicKey, destination, payer.publicKey, 0n, DECIMALS, [], TOKEN_2022_PROGRAM_ID
+      );
+      ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
+      ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+      expectCustomError(send([ix], [payer]) as FailedTransactionMetadata, ERR.WEEKEND, "zero-amount weekend transfer");
+    });
+
+    // Token-2022 short-circuits a transfer whose source and destination are the
+    // same account: it returns early WITHOUT invoking the transfer hook. This
+    // is not a hole -- no value moves and no counterparty is involved -- but it
+    // is the one transfer shape where the hook does not run, so it is pinned
+    // here rather than assumed.
+    it("self-transfers bypass the hook entirely, and move nothing", () => {
+      setClock(T.weekend.ts);
+      const before = rawBalance(source);
+      const ix = createTransferCheckedInstruction(
+        source, mint.publicKey, source, payer.publicKey, 1_000n, DECIMALS, [], TOKEN_2022_PROGRAM_ID
+      );
+      ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
+      ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+      const r = send([ix], [payer]);
+
+      expect(r instanceof FailedTransactionMetadata, "Token-2022 accepts it without calling the hook").to.be.false;
+      expect(rawBalance(source), "balance is unchanged, so no value moved").to.equal(before);
+
+      // Prove the hook really was not invoked, rather than invoked and passing.
+      const logs = (r as any).meta?.().logs?.() ?? [];
+      expect(
+        logs.some((l: string) => l.includes(PROGRAM_ID.toBase58())),
+        "hook program should not appear in the logs"
+      ).to.be.false;
     });
   });
 

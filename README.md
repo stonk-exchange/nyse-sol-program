@@ -90,10 +90,40 @@ npm run gen:table      # regenerate the table
 A differential of the implementation against tzdata over 525,888 five-minute
 slots spanning 2026–2031 matches exactly.
 
-**25 integration tests** running the compiled program under LiteSVM with a
+**33 integration tests** running the compiled program under LiteSVM with a
 controlled clock. They attempt real Token-2022 transfers at each market state
-and assert on the on-chain error code and token balances, plus cover the
-launch configuration (fixed supply, immutable hook, immutable metadata).
+and assert on the on-chain error code and token balances, and cover the launch
+configuration, delegated transfers, the session boundaries to the second, and
+the operations the hook does not gate.
+
+### On a real validator
+
+LiteSVM is not a validator, so the hook is also checked on real hardware:
+
+```bash
+solana-test-validator --reset \
+  --bpf-program CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k \
+    target/deploy/nyse_token_hook.so
+npm run verify:validator
+```
+
+The validator's clock follows real time, so this compares the hook's verdict
+against the actual NYSE state at the moment you run it, and separately checks a
+clock-independent failure path (a direct `Execute` call must be rejected). A
+bare hooked transfer costs ~33-39k CU on real hardware, below the LiteSVM
+figures quoted above, so the benchmark numbers are conservative.
+
+### Clock drift
+
+```bash
+npm run drift
+```
+
+The hook trusts `Clock::unix_timestamp`, which is a stake-weighted estimate.
+Measured against real time, mainnet and devnet were within **1 second**. That
+bounds how wrong the hook can be, and only within that many seconds of 09:30 or
+16:00. Solana's clock has drifted further under network stress historically, so
+treat this as a current measurement rather than a guarantee.
 
 ### Against Orca's real program
 
@@ -111,10 +141,13 @@ TokenBadge; Orca's program is untouched.
 | `initializePoolV2` without a badge | rejected, `UnsupportedTokenMint` (6047) |
 | `initializePoolV2` with a badge | pool created |
 | `increaseLiquidityV2` in session | liquidity added, vault funded |
-| `swapV2` in session | succeeds, ~92–101k CU for the whole swap |
+| `swapV2` in session | succeeds |
 | `swapV2` at 16:30 ET | rejected, `MarketClosedAfterHours` (6003) |
 | `swapV2` on a Saturday | rejected, `MarketClosedWeekend` (6000) |
 | `swapV2` when the market reopens | succeeds again |
+| `decreaseLiquidityV2` on a Saturday | rejected — LPs cannot withdraw |
+| `collectFeesV2` on a Saturday | rejected — LPs cannot collect |
+| both, once the market reopens | succeed |
 
 The blocked swaps fail with *this program's* error codes propagating out through
 Token-2022 into Whirlpool, so the restriction holds through a real AMM swap path.
@@ -254,6 +287,12 @@ economically unlikely, not impossible, and completion revokes the hook forever.
 ---
 
 ## Limitations
+
+**Self-transfers bypass the hook.** Token-2022 short-circuits a transfer whose
+source and destination are the same account, returning before it would invoke
+the hook. No value moves and no counterparty is involved, so this is not a way
+to trade, but it is the one transfer shape where the hook does not run. Pinned
+by a test.
 
 **Only transfers are gated.** Token-2022 invokes a transfer hook from
 `Transfer`/`TransferChecked` and nowhere else. Burning, minting and approving a
