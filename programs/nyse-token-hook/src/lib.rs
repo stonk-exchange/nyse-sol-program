@@ -150,8 +150,19 @@ pub struct TransferHook<'info> {
     /// CHECK: passed through from the transfer instruction; not authorizing anything here.
     pub authority: UncheckedAccount<'info>,
 
-    /// CHECK: PDA validated by the seeds constraint.
-    #[account(seeds = [b"extra-account-metas", mint.key().as_ref()], bump)]
+    /// The hook's validation-state PDA.
+    ///
+    /// Deliberately NOT constrained by seeds. An Anchor `bump` constraint
+    /// performs `find_program_address` on chain, which costs ~3,000 CU per bump
+    /// iteration on EVERY transfer -- unbounded in the worst case, since the
+    /// canonical bump depends on the mint address.
+    ///
+    /// The check bought nothing. This hook's decision depends only on the
+    /// clock: it never reads this account, and it applies the same rule to
+    /// every mint. Token-2022 chooses which accounts to pass, and
+    /// `assert_is_transferring` already rejects direct invocation.
+    ///
+    /// CHECK: unused; present only to match the transfer-hook account layout.
     pub extra_account_meta_list: UncheckedAccount<'info>,
 }
 

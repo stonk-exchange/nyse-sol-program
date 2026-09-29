@@ -82,6 +82,20 @@ function loadWallet(): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(path, "utf8"))));
 }
 
+/** Find a mint keypair whose extra-account-metas PDA has bump 255. */
+function grindMint(maxAttempts = 10_000): Keypair {
+  for (let i = 0; i < maxAttempts; i++) {
+    const kp = Keypair.generate();
+    const [, bump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("extra-account-metas"), kp.publicKey.toBuffer()],
+      HOOK_PROGRAM_ID
+    );
+    if (bump === 255) return kp;
+  }
+  // Not worth failing the launch over; the cost is a few thousand CU.
+  return Keypair.generate();
+}
+
 function anchorDiscriminator(name: string): Buffer {
   return createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
 }
@@ -97,10 +111,18 @@ async function main() {
 
   const supply = supplyWhole * 10n ** BigInt(decimals);
   const wallet = loadWallet();
-  const mint = Keypair.generate();
+
+  // Grind for a mint whose validation PDA has the highest possible bump.
+  //
+  // Token-2022 derives this PDA with find_program_address on every transfer,
+  // and each bump iteration it has to try costs ~1,500 CU. A mint whose
+  // canonical bump is 255 resolves on the first try; one with bump 248 pays an
+  // extra ~10,500 CU on every transfer, forever. Roughly half of all keypairs
+  // give 255, so this is nearly free.
+  const mint = grindMint();
   const connection = new Connection(clusterApiUrl(cluster), "confirmed");
 
-  const [extraMetas] = PublicKey.findProgramAddressSync(
+  const [extraMetas, metasBump] = PublicKey.findProgramAddressSync(
     [Buffer.from("extra-account-metas"), mint.publicKey.toBuffer()],
     HOOK_PROGRAM_ID
   );
@@ -133,7 +155,7 @@ async function main() {
   console.log(`  name / symbol  ${name} / ${symbol}`);
   console.log(`  uri            ${uri}`);
   console.log(`  hook program   ${HOOK_PROGRAM_ID.toBase58()}`);
-  console.log(`  validation PDA ${extraMetas.toBase58()}`);
+  console.log(`  validation PDA ${extraMetas.toBase58()} (bump ${metasBump}${metasBump === 255 ? "" : ", costs ~" + (255 - metasBump) * 1500 + " extra CU per transfer"})`);
   console.log(`  treasury ATA   ${treasury.toBase58()}`);
   console.log(`  supply         ${supplyWhole} (${supply} base units, ${decimals} decimals)`);
   console.log(`  account size   ${mintLen} + ${metadataLen} metadata`);

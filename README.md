@@ -122,6 +122,33 @@ Token-2022 into Whirlpool, so the restriction holds through a real AMM swap path
 Note: Whirlpool rejects a clock that moves backwards with `InvalidTimestamp`, so
 the test's scenarios are ordered strictly forward in time.
 
+### Compute budget
+
+```bash
+npm run bench   # needs the Orca fixtures
+```
+
+Builds two identical Orca pools -- one hooked, one not -- and runs the same
+operations on both, so the delta is the hook's marginal cost.
+
+| Operation | No hook | With hook | Delta |
+| --- | ---: | ---: | ---: |
+| `increaseLiquidityV2` | ~23k | ~60k | +37k |
+| `swapV2`, within one tick array | ~48k | ~96k | +48k |
+| `swapV2`, crossing ~3 tick arrays | ~73k | ~121k | +48k |
+| `twoHopSwapV2` (aggregator-style route) | ~82k | ~127k | +45k |
+
+The hook costs a roughly constant ~40-50k CU regardless of swap size, because
+it runs once per transfer rather than once per tick crossed. Worst case measured
+is ~127k, comfortably inside the 200,000 CU default transaction budget.
+
+**The mint address affects this.** Token-2022 derives the validation PDA with
+`find_program_address` on every transfer, and each bump iteration it has to try
+costs ~1,500 CU. A mint whose canonical bump is 255 resolves first try; one with
+bump 248 pays an extra ~10,500 CU on every transfer for the life of the token.
+`launch-token.ts` grinds for bump 255, which is nearly free since roughly half of
+all keypairs qualify. `scripts/probe-bump-cost.ts` measures the relationship.
+
 ---
 
 ## Launching
