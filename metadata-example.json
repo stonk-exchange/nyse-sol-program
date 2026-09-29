@@ -1,0 +1,20 @@
+{
+  "name": "STONKS",
+  "symbol": "STONKS",
+  "description": "A Token-2022 mint whose transfers are restricted to NYSE trading hours: 09:30-16:00 ET, Monday to Friday, excluding exchange holidays. Enforced on-chain by a transfer hook.",
+  "image": "https://replace-me.example/logo.png",
+  "external_url": "https://replace-me.example",
+  "attributes": [
+    { "trait_type": "Trading Hours", "value": "09:30-16:00 ET" },
+    { "trait_type": "Trading Days", "value": "Monday - Friday" },
+    { "trait_type": "Weekends", "value": "Transfers blocked" },
+    { "trait_type": "Exchange Holidays", "value": "Transfers blocked" },
+    { "trait_type": "Timezone", "value": "US Eastern (EST/EDT)" },
+    { "trait_type": "Enforcement", "value": "Token-2022 transfer hook" },
+    { "trait_type": "Token Standard", "value": "SPL Token-2022" }
+  ],
+  "properties": {
+    "category": "utility",
+    "creators": []
+  }
+}
