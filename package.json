@@ -3,15 +3,16 @@
   "scripts": {
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "cargo test -p nyse-token-hook",
-    "test:integration": "anchor build && ts-mocha -p ./tsconfig.json -t 1000000 'tests/**/*.ts'",
+    "test:integration": "anchor build && ts-mocha -p ./tsconfig.json -t 1000000 'tests/nyse-token-hook.ts'",
     "gen:table": "python3 scripts/gen_market_table.py",
     "check:tzdata": "python3 scripts/gen_market_table.py --check",
     "lint": "prettier '*/**/*{.js,.ts}' --check",
     "lint:fix": "prettier '*/**/*{.js,.ts}' -w",
-    "check:mint": "ts-node scripts/check-mint-readiness.ts"
+    "check:mint": "ts-node scripts/check-mint-readiness.ts",
+    "test:orca": "anchor build && ts-mocha -p ./tsconfig.json -t 1000000 'tests/orca-integration.ts'",
+    "fetch:orca": "./scripts/fetch-orca-fixtures.sh"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.31.1",
     "@metaplex-foundation/mpl-token-metadata": "^3.4.0",
     "@metaplex-foundation/umi": "^1.2.0",
     "@metaplex-foundation/umi-bundle-defaults": "^1.2.0",
@@ -21,6 +22,8 @@
     "litesvm": "^0.2.0"
   },
   "devDependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@orca-so/whirlpools-sdk": "^0.22.0",
     "@types/bn.js": "^5.1.0",
     "@types/chai": "^4.3.0",
     "@types/mocha": "^9.0.0",

@@ -160,6 +160,31 @@ reads a mint and reports it against each venue's rules:
 **Orca is currently the only venue that keeps the hook alive permanently.** A
 TokenBadge is a PDA that Orca controls, so listing is a permissioned step.
 
+This is verified end to end against Orca's real mainnet Whirlpool program, not
+by reading docs. [tests/orca-integration.ts](tests/orca-integration.ts) loads the
+mainnet program binary and Orca's live `WhirlpoolsConfig` into LiteSVM (only the
+config's authorities are repointed, so the test can issue itself a badge), then:
+
+```bash
+./scripts/fetch-orca-fixtures.sh   # pulls the program + config from mainnet
+npm run test:orca
+```
+
+| Result | |
+| --- | --- |
+| `initializePoolV2` without a badge | rejected, `UnsupportedTokenMint` (6047) |
+| `initializePoolV2` with a badge | pool created |
+| `increaseLiquidityV2` in session | liquidity added, vault funded |
+| `swapV2` in session | succeeds, ~92-101k CU for the whole swap |
+| `swapV2` at 16:30 ET | rejected, our `MarketClosedAfterHours` (6003) |
+| `swapV2` on Saturday | rejected, our `MarketClosedWeekend` (6000) |
+| `swapV2` when the market reopens | succeeds again |
+
+The blocked swaps fail with *our* hook's error codes propagating out through
+Token-2022 into Whirlpool, so the restriction demonstrably survives a real AMM
+swap path. Note the clock only moves forward in that test: Whirlpool rejects a
+backwards clock with `InvalidTimestamp`.
+
 Build Orca instructions with the legacy [`@orca-so/whirlpools-sdk`](https://www.npmjs.com/package/@orca-so/whirlpools-sdk),
 which wires hook accounts via `RemainingAccountsBuilder` +
 `TokenExtensionUtil.getExtraAccountMetasForTransferHook`. The newer

@@ -87,3 +87,6 @@ pids
 
 # Anchor test artifacts
 .pytest_cache/
+
+# Orca test fixtures (fetched from mainnet, see scripts/fetch-orca-fixtures.sh)
+fixtures/
