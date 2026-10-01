@@ -15,7 +15,8 @@
     "verify:validator": "ts-node scripts/verify-on-validator.ts",
     "drift": "ts-node scripts/measure-clock-drift.ts",
     "dbc:config": "ts-node scripts/launch-dbc.ts config",
-    "dbc:token": "ts-node scripts/launch-dbc.ts token"
+    "dbc:token": "ts-node scripts/launch-dbc.ts token",
+    "probe:mainnet": "ts-node scripts/probe-hooked-tokens.ts"
   },
   "dependencies": {
     "@metaplex-foundation/mpl-token-metadata": "^3.4.0",

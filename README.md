@@ -117,6 +117,26 @@ clock-independent failure path (a direct `Execute` call must be rejected). A
 bare hooked transfer costs ~33-39k CU on real hardware, below the LiteSVM
 figures quoted above, so the benchmark numbers are conservative.
 
+### Verifying a live mint on mainnet
+
+```bash
+npm run probe:mainnet -- --mints <MINT>[,<MINT>...]
+```
+
+Finds a funded holder for each mint, builds a real `TransferChecked` with the
+hook's resolved extra accounts, and simulates it against live mainnet with
+`sigVerify` disabled -- nothing is signed, sent, or paid for, but the cluster
+executes it against real account state and the real `Clock`. Reports TRADEABLE
+or BLOCKED plus the compute units the hook consumed.
+
+Because it uses the live clock it only describes the current moment, so run it
+once while the market is open and again while it is closed. A hook that is
+working shows TRADEABLE in session and BLOCKED outside it; a hook that is
+present but not enforcing shows TRADEABLE in both, usually with a noticeably
+lower CU figure because it never reaches the calendar code.
+
+`scripts/probe-mainnet-hook.ts` is the single-mint version, with full logs.
+
 ### Clock drift
 
 ```bash
