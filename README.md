@@ -263,6 +263,59 @@ Reads the mint and reports its configuration plus a per-venue verdict.
 
 ---
 
+## Launching on Meteora DBC
+
+[`scripts/launch-dbc.ts`](scripts/launch-dbc.ts) launches tokens on a Meteora
+Dynamic Bonding Curve with you as the partner collecting the trading fee. This
+is the same venue and the same curve configuration as the existing hooked
+tokens, so the result trades identically.
+
+```bash
+# once: create your partner config. You are the fee claimer.
+ANCHOR_WALLET=./hot.json npx ts-node scripts/launch-dbc.ts config \
+  --cluster mainnet-beta --fee-claimer <YOUR_LEDGER_ADDRESS> --execute
+
+# per token, reusing that config forever
+ANCHOR_WALLET=./hot.json npx ts-node scripts/launch-dbc.ts token \
+  --cluster mainnet-beta --config <CONFIG> \
+  --name "STONKS" --symbol STONKS --uri https://example.com/meta.json --execute
+```
+
+Both commands dry-run without `--execute`. `--rpc` points them at any endpoint,
+so the whole flow can be rehearsed against a local validator with the DBC
+program cloned in.
+
+**DBC does not initialise our validation state.** It creates the mint and points
+it at this program, but it cannot know this program also needs its
+`extra-account-metas` account. Without it every swap fails with
+`MissingRemainingAccountForTransferHook` (DBC error 6071). The `token` command
+does this immediately after pool creation and verifies the account exists before
+reporting success.
+
+**The restriction ends at graduation.** DBC holds the mint's transfer-hook
+authority so it can revoke the hook when the curve completes, which it must
+because DAMM v2 cannot forward hook accounts. The trading-hours rule therefore
+applies for the bonding-curve phase only. This is inherent to DBC and is the
+same deal every other hooked token on it has.
+
+### Verified against the real program
+
+The whole flow was rehearsed against Meteora's mainnet DBC binary on a local
+validator, with the wrapped-SOL mint cloned in:
+
+| Step | Result |
+| --- | --- |
+| Create partner config | succeeded, 31k CU |
+| Create pool with our hook | succeeded |
+| Initialise hook validation state | succeeded |
+| Buy 0.1 SOL of the token | succeeded, hook invoked, 117k CU |
+| Partner fee credited | 0.0008 SOL on a 0.1 SOL buy |
+
+The launched mint matches the existing hooked tokens exactly: same extensions
+(`MetadataPointer`, `TransferHook`, `TokenMetadata`), 6 decimals, 1e15 supply,
+mint and freeze authorities revoked, hook authority held by the DBC pool
+authority — but pointing at this program.
+
 ## Venue support
 
 This is the binding constraint, not the hook. A transfer hook can make a

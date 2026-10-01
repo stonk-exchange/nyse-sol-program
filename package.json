@@ -13,7 +13,9 @@
     "fetch:orca": "./scripts/fetch-orca-fixtures.sh",
     "bench": "anchor build && ts-node scripts/bench-compute.ts",
     "verify:validator": "ts-node scripts/verify-on-validator.ts",
-    "drift": "ts-node scripts/measure-clock-drift.ts"
+    "drift": "ts-node scripts/measure-clock-drift.ts",
+    "dbc:config": "ts-node scripts/launch-dbc.ts config",
+    "dbc:token": "ts-node scripts/launch-dbc.ts token"
   },
   "dependencies": {
     "@metaplex-foundation/mpl-token-metadata": "^3.4.0",
@@ -26,6 +28,7 @@
   },
   "devDependencies": {
     "@coral-xyz/anchor": "^0.32.1",
+    "@meteora-ag/dynamic-bonding-curve-sdk": "^1.5.13",
     "@orca-so/whirlpools-sdk": "^0.22.0",
     "@types/bn.js": "^5.1.0",
     "@types/chai": "^4.3.0",
