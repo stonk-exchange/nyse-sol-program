@@ -41,8 +41,6 @@ import {
   AuthorityType,
   ExtensionType,
   LENGTH_SIZE,
-  createInitializeTransferFeeConfigInstruction,
-  getTransferFeeConfig,
   TYPE_SIZE,
   getMintLen,
   getMint,
@@ -109,14 +107,15 @@ async function main() {
   const name = arg("name");
   const symbol = arg("symbol");
   const uri = arg("uri");
-  // Trading fee, in basis points, charged by Token-2022 on every transfer.
-  const feeBps = Number(arg("fee-bps", "0"));
   const execute = process.argv.includes("--execute");
-
-  if (feeBps < 0 || feeBps > 10_000) throw new Error("--fee-bps must be 0..10000");
 
   const supply = supplyWhole * 10n ** BigInt(decimals);
   const wallet = loadWallet();
+
+  // Where the supply lands. Defaults to the payer, but for a hardware-wallet
+  // launch this should be the Ledger address, so the hot key that signs never
+  // holds the tokens.
+  const treasuryOwner = new PublicKey(arg("treasury", wallet.publicKey.toBase58()));
 
   // Grind for a mint whose validation PDA has the highest possible bump.
   //
@@ -134,7 +133,7 @@ async function main() {
   );
   const treasury = getAssociatedTokenAddressSync(
     mint.publicKey,
-    wallet.publicKey,
+    treasuryOwner,
     false,
     TOKEN_2022_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID
@@ -151,9 +150,6 @@ async function main() {
   };
 
   const extensions = [ExtensionType.TransferHook, ExtensionType.MetadataPointer];
-  if (feeBps > 0) extensions.unshift(ExtensionType.TransferFeeConfig);
-  // Cap at the full u64 so the fee is always feeBps, never truncated.
-  const maxFee = (1n << 64n) - 1n;
   const mintLen = getMintLen(extensions);
   const metadataLen = TYPE_SIZE + LENGTH_SIZE + pack(metadata).length;
 
@@ -165,16 +161,12 @@ async function main() {
   console.log(`  uri            ${uri}`);
   console.log(`  hook program   ${HOOK_PROGRAM_ID.toBase58()}`);
   console.log(`  validation PDA ${extraMetas.toBase58()} (bump ${metasBump}${metasBump === 255 ? "" : ", costs ~" + (255 - metasBump) * 1500 + " extra CU per transfer"})`);
+  console.log(`  supply goes to ${treasuryOwner.toBase58()}`);
   console.log(`  treasury ATA   ${treasury.toBase58()}`);
   console.log(`  supply         ${supplyWhole} (${supply} base units, ${decimals} decimals)`);
-  console.log(`  trading fee    ${feeBps > 0 ? `${feeBps} bps (${feeBps / 100}%) withheld on every transfer` : "none"}`);
   console.log(`  account size   ${mintLen} + ${metadataLen} metadata`);
   console.log("  hook authority none from creation (enforced by the program)");
   console.log("  after launch   mint / freeze / metadata authorities also revoked");
-  if (feeBps > 0) {
-    console.log(`                 fee config authority revoked (rate is permanent)`);
-    console.log(`                 withdraw-withheld authority stays with ${wallet.publicKey.toBase58()}`);
-  }
 
   if (!execute) {
     console.log("\nDry run. Re-run with --execute to send these transactions.");
@@ -199,20 +191,6 @@ async function main() {
       lamports,
       programId: TOKEN_2022_PROGRAM_ID,
     }),
-    ...(feeBps > 0
-      ? [
-          createInitializeTransferFeeConfigInstruction(
-            mint.publicKey,
-            // No config authority: the fee rate can never be changed.
-            null,
-            // Withheld fees accrue on recipient accounts; this key harvests them.
-            wallet.publicKey,
-            feeBps,
-            maxFee,
-            TOKEN_2022_PROGRAM_ID
-          ),
-        ]
-      : []),
     createInitializeMetadataPointerInstruction(
       mint.publicKey,
       wallet.publicKey,
@@ -272,7 +250,7 @@ async function main() {
     createAssociatedTokenAccountInstruction(
       wallet.publicKey,
       treasury,
-      wallet.publicKey,
+      treasuryOwner,
       mint.publicKey,
       TOKEN_2022_PROGRAM_ID,
       ASSOCIATED_TOKEN_PROGRAM_ID
@@ -324,22 +302,6 @@ async function main() {
     ["metadata name matches", onChainMeta?.name === name],
     ["metadata symbol matches", onChainMeta?.symbol === symbol],
     ["metadata uri matches", onChainMeta?.uri === uri],
-    ...(feeBps > 0
-      ? ([
-          [
-            "transfer fee set and immutable",
-            (() => {
-              const fee = getTransferFeeConfig(info);
-              return (
-                fee !== null &&
-                fee.newerTransferFee.transferFeeBasisPoints === feeBps &&
-                (fee.transferFeeConfigAuthority === null ||
-                  fee.transferFeeConfigAuthority.equals(PublicKey.default))
-              );
-            })(),
-          ],
-        ] as [string, boolean][])
-      : []),
     [
       "metadata update authority revoked",
       onChainMeta != null &&
@@ -364,12 +326,12 @@ async function main() {
         hookProgram: HOOK_PROGRAM_ID.toBase58(),
         extraAccountMetaList: extraMetas.toBase58(),
         treasury: treasury.toBase58(),
+        treasuryOwner: treasuryOwner.toBase58(),
         name,
         symbol,
         uri,
         decimals,
         supply: supply.toString(),
-        transferFeeBps: feeBps,
         authoritiesRevoked: { mint: true, freeze: true, transferHook: true, metadata: true },
         launchedAt: new Date().toISOString(),
       },
