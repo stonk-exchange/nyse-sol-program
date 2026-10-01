@@ -169,7 +169,8 @@ async function main() {
   console.log(`  supply         ${supplyWhole} (${supply} base units, ${decimals} decimals)`);
   console.log(`  trading fee    ${feeBps > 0 ? `${feeBps} bps (${feeBps / 100}%) withheld on every transfer` : "none"}`);
   console.log(`  account size   ${mintLen} + ${metadataLen} metadata`);
-  console.log("  after launch   mint / freeze / hook / metadata authorities all revoked");
+  console.log("  hook authority none from creation (enforced by the program)");
+  console.log("  after launch   mint / freeze / metadata authorities also revoked");
   if (feeBps > 0) {
     console.log(`                 fee config authority revoked (rate is permanent)`);
     console.log(`                 withdraw-withheld authority stays with ${wallet.publicKey.toBase58()}`);
@@ -218,9 +219,11 @@ async function main() {
       mint.publicKey, // metadata stored on the mint itself
       TOKEN_2022_PROGRAM_ID
     ),
+    // No hook authority from the very start. The program refuses to initialise
+    // its validation state otherwise, so the restriction can never be removed.
     createInitializeTransferHookInstruction(
       mint.publicKey,
-      wallet.publicKey,
+      PublicKey.default,
       HOOK_PROGRAM_ID,
       TOKEN_2022_PROGRAM_ID
     ),
@@ -296,14 +299,6 @@ async function main() {
       [],
       TOKEN_2022_PROGRAM_ID
     ),
-    createSetAuthorityInstruction(
-      mint.publicKey,
-      wallet.publicKey,
-      AuthorityType.TransferHookProgramId,
-      null,
-      [],
-      TOKEN_2022_PROGRAM_ID
-    )
   );
   console.log(
     "3/3 minting supply and revoking authorities:",

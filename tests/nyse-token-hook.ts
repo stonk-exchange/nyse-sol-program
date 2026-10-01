@@ -17,6 +17,7 @@ import {
 } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
   ExtensionType,
   getMintLen,
@@ -230,7 +231,7 @@ describe("NYSE transfer hook", () => {
         }),
         createInitializeTransferHookInstruction(
           mint.publicKey,
-          payer.publicKey,
+          PublicKey.default,
           PROGRAM_ID,
           TOKEN_2022_PROGRAM_ID
         ),
@@ -721,7 +722,7 @@ describe("launch configuration: fixed supply, immutable hook and metadata", () =
         ),
         createInitializeTransferHookInstruction(
           mint.publicKey,
-          payer.publicKey,
+          PublicKey.default,
           PROGRAM_ID,
           TOKEN_2022_PROGRAM_ID
         ),
@@ -804,11 +805,7 @@ describe("launch configuration: fixed supply, immutable hook and metadata", () =
           mint.publicKey, payer.publicKey, AuthorityType.MintTokens, null, [],
           TOKEN_2022_PROGRAM_ID
         ),
-        // 3. The hook can never be repointed at a different program.
-        createSetAuthorityInstruction(
-          mint.publicKey, payer.publicKey, AuthorityType.TransferHookProgramId, null, [],
-          TOKEN_2022_PROGRAM_ID
-        ),
+
       ],
       [payer]
     );
@@ -1019,7 +1016,7 @@ describe("transfer fee plus the NYSE hook", () => {
       createInitializeTransferFeeConfigInstruction(
         mint.publicKey, null, payer.publicKey, FEE_BPS, (1n << 64n) - 1n, TOKEN_2022_PROGRAM_ID
       ),
-      createInitializeTransferHookInstruction(mint.publicKey, payer.publicKey, PROGRAM_ID, TOKEN_2022_PROGRAM_ID),
+      createInitializeTransferHookInstruction(mint.publicKey, PublicKey.default, PROGRAM_ID, TOKEN_2022_PROGRAM_ID),
       createInitializeMintInstruction(mint.publicKey, DECIMALS, payer.publicKey, null, TOKEN_2022_PROGRAM_ID),
     ], [mint]);
     expect(created instanceof FailedTransactionMetadata,
@@ -1083,5 +1080,97 @@ describe("transfer fee plus the NYSE hook", () => {
         fee!.transferFeeConfigAuthority.equals(PublicKey.default),
       "fee config authority must be revoked so the rate can never change"
     ).to.be.true;
+  });
+});
+
+/**
+ * The hook refuses to serve a mint whose restriction could later be removed.
+ *
+ * This is what makes the trading hours permanent. The program cannot stop a
+ * mint's transfer-hook authority from repointing the hook at a no-op, so
+ * instead it refuses to initialise the validation state unless that authority
+ * is already revoked. Without the validation state Token-2022 cannot transfer
+ * the mint at all, so a token either enforces these hours for life or never
+ * works. It also means a launchpad that must hold the hook authority in order
+ * to revoke it at graduation cannot use this program.
+ */
+describe("the hook can never be detached from a mint", () => {
+  const ERR_AUTH_LIVE = 6010; // MintHookAuthorityNotRevoked
+  const ERR_WRONG_PROGRAM = 6009; // MintHookIsNotThisProgram
+
+  let svm: LiteSVM;
+  let payer: Keypair;
+
+  function send(ixs: TransactionInstruction[], signers: Keypair[]) {
+    svm.expireBlockhash();
+    const tx = new Transaction();
+    tx.recentBlockhash = svm.latestBlockhash();
+    tx.feePayer = payer.publicKey;
+    ixs.forEach((i) => tx.add(i));
+    tx.sign(payer, ...signers);
+    return svm.sendTransaction(tx);
+  }
+
+  /** Create a mint with the given hook authority and hook program, then try to
+   *  initialise our validation state for it. */
+  function tryInit(hookAuthority: PublicKey, hookProgram: PublicKey) {
+    const mint = Keypair.generate();
+    const [extraMetas] = PublicKey.findProgramAddressSync(
+      [Buffer.from("extra-account-metas"), mint.publicKey.toBuffer()], PROGRAM_ID
+    );
+    const mintLen = getMintLen([ExtensionType.TransferHook]);
+    const made = send([
+      SystemProgram.createAccount({
+        fromPubkey: payer.publicKey, newAccountPubkey: mint.publicKey, space: mintLen,
+        lamports: Number(svm.minimumBalanceForRentExemption(BigInt(mintLen))),
+        programId: TOKEN_2022_PROGRAM_ID,
+      }),
+      createInitializeTransferHookInstruction(mint.publicKey, hookAuthority, hookProgram, TOKEN_2022_PROGRAM_ID),
+      createInitializeMintInstruction(mint.publicKey, DECIMALS, payer.publicKey, null, TOKEN_2022_PROGRAM_ID),
+    ], [mint]);
+    expect(made instanceof FailedTransactionMetadata, "mint creation should succeed").to.be.false;
+
+    return send([{
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+        { pubkey: extraMetas, isSigner: false, isWritable: true },
+        { pubkey: mint.publicKey, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: anchorDiscriminator("initialize_extra_account_meta_list"),
+    } as TransactionInstruction], [payer]);
+  }
+
+  before(() => {
+    svm = new LiteSVM().withBuiltins().withSplPrograms().withSysvars();
+    svm.addProgramFromFile(PROGRAM_ID, SO_PATH);
+    payer = Keypair.generate();
+    svm.airdrop(payer.publicKey, 100_000_000_000n);
+    const c = svm.getClock();
+    c.unixTimestamp = T.openRegular.ts;
+    svm.setClock(c);
+  });
+
+  it("refuses a mint whose hook authority is still live", () => {
+    const r = tryInit(payer.publicKey, PROGRAM_ID);
+    expect(r instanceof FailedTransactionMetadata, "init should be rejected").to.be.true;
+    expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_AUTH_LIVE));
+  });
+
+  it("refuses a mint pointing its hook at a different program", () => {
+    // Not SystemProgram: its id is all-zeros, which Token-2022 reads as "no
+    // hook program" rather than a different one.
+    const r = tryInit(PublicKey.default, TOKEN_PROGRAM_ID);
+    expect(r instanceof FailedTransactionMetadata, "init should be rejected").to.be.true;
+    expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_WRONG_PROGRAM));
+  });
+
+  it("accepts a mint whose hook authority is revoked", () => {
+    const r = tryInit(PublicKey.default, PROGRAM_ID);
+    expect(
+      r instanceof FailedTransactionMetadata,
+      `init should succeed, got ${r instanceof FailedTransactionMetadata ? r.err().toString() : ""}`
+    ).to.be.false;
   });
 });

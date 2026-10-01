@@ -194,7 +194,7 @@ const haveFixtures = fs.existsSync(ORCA_SO) && fs.existsSync(ORCA_CFG) && fs.exi
         lamports: Number(svm.minimumBalanceForRentExemption(BigInt(mintLen))),
         programId: TOKEN_2022_PROGRAM_ID,
       }),
-      createInitializeTransferHookInstruction(hookedMint.publicKey, payer.publicKey, HOOK, TOKEN_2022_PROGRAM_ID),
+      createInitializeTransferHookInstruction(hookedMint.publicKey, PublicKey.default, HOOK, TOKEN_2022_PROGRAM_ID),
       createInitializeMintInstruction(hookedMint.publicKey, 9, payer.publicKey, null, TOKEN_2022_PROGRAM_ID),
     ], [hookedMint], "create hooked mint");
 

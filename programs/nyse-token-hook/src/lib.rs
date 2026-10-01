@@ -1,9 +1,10 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_2022::spl_token_2022::{
     extension::{
-        transfer_hook::TransferHookAccount, BaseStateWithExtensions, StateWithExtensions,
+        transfer_hook::{TransferHook as TransferHookExtension, TransferHookAccount},
+        BaseStateWithExtensions, StateWithExtensions,
     },
-    state::Account as Token2022Account,
+    state::{Account as Token2022Account, Mint as Token2022Mint},
 };
 use anchor_spl::token_interface;
 use spl_tlv_account_resolution::state::ExtraAccountMetaList;
@@ -35,6 +36,21 @@ pub mod nyse_token_hook {
     pub fn initialize_extra_account_meta_list(
         ctx: Context<InitializeExtraAccountMetaList>,
     ) -> Result<()> {
+        // Refuse to serve any mint whose hook could later be removed.
+        //
+        // This program cannot stop a mint's transfer-hook authority from
+        // repointing the hook at a no-op, which would silently delete the
+        // trading-hours restriction. What it CAN do is refuse to initialise the
+        // validation state unless that authority is already revoked -- and
+        // without the validation state, Token-2022 cannot transfer the mint at
+        // all. So a token either enforces these hours for its whole life, or it
+        // never functions.
+        //
+        // A consequence worth stating plainly: launchpads that must hold the
+        // hook authority in order to revoke it later (Meteora DBC, for example)
+        // cannot use this program. That is the intent.
+        assert_hook_is_permanent(&ctx.accounts.mint.to_account_info())?;
+
         let account_metas = vec![];
         let account_info = ctx.accounts.extra_account_meta_list.to_account_info();
 
@@ -92,6 +108,31 @@ pub mod nyse_token_hook {
             _ => err!(NyseError::UnsupportedInstruction),
         }
     }
+}
+
+/// Require that the mint points its transfer hook at this program and has
+/// permanently given up the ability to change that.
+fn assert_hook_is_permanent(mint_info: &AccountInfo) -> Result<()> {
+    let data = mint_info.try_borrow_data()?;
+    let state = StateWithExtensions::<Token2022Mint>::unpack(&data)
+        .map_err(|_| error!(NyseError::InvalidMint))?;
+    let hook = state
+        .get_extension::<TransferHookExtension>()
+        .map_err(|_| error!(NyseError::MintHasNoTransferHook))?;
+
+    let program_id: Option<Pubkey> = hook.program_id.into();
+    require!(
+        program_id == Some(crate::ID),
+        NyseError::MintHookIsNotThisProgram
+    );
+
+    let authority: Option<Pubkey> = hook.authority.into();
+    require!(
+        authority.is_none(),
+        NyseError::MintHookAuthorityNotRevoked
+    );
+
+    Ok(())
 }
 
 /// Verify the account is mid-transfer, i.e. we were invoked by Token-2022 as
@@ -191,6 +232,14 @@ pub enum NyseError {
     InvalidTokenAccount,
     #[msg("Unsupported transfer hook instruction")]
     UnsupportedInstruction,
+    #[msg("Could not parse the mint as Token-2022 state")]
+    InvalidMint,
+    #[msg("Mint has no transfer hook extension")]
+    MintHasNoTransferHook,
+    #[msg("Mint's transfer hook points at a different program")]
+    MintHookIsNotThisProgram,
+    #[msg("Mint's transfer hook authority must be revoked before initialization, so the trading-hours restriction can never be removed")]
+    MintHookAuthorityNotRevoked,
 }
 
 // ---------------------------------------------------------------------------

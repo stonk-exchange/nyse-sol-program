@@ -48,6 +48,10 @@ suite pins that choice.
 | 6004 | `NotTransferring` | `Execute` called outside a real transfer |
 | 6005 | `InvalidTokenAccount` | Source account is not parseable Token-2022 state |
 | 6006 | `UnsupportedInstruction` | Non-`Execute` transfer-hook instruction |
+| 6007 | `InvalidMint` | Mint is not parseable Token-2022 state |
+| 6008 | `MintHasNoTransferHook` | Mint has no transfer hook extension |
+| 6009 | `MintHookIsNotThisProgram` | Mint's hook points elsewhere |
+| 6010 | `MintHookAuthorityNotRevoked` | Hook could still be removed; refused at init |
 
 ---
 
@@ -90,7 +94,7 @@ npm run gen:table      # regenerate the table
 A differential of the implementation against tzdata over 525,888 five-minute
 slots spanning 2026–2031 matches exactly.
 
-**36 integration tests** running the compiled program under LiteSVM with a
+**39 integration tests** running the compiled program under LiteSVM with a
 controlled clock. They attempt real Token-2022 transfers at each market state
 and assert on the on-chain error code and token balances, and cover the launch
 configuration, delegated transfers, the session boundaries to the second, and
@@ -224,7 +228,7 @@ verifies:
 | Mint authority | Revoked — supply can never increase |
 | Freeze authority | Never set — no one can freeze or thaw a holder |
 | Transfer hook | Still points at this program |
-| Transfer hook authority | Revoked — the hook can never be repointed |
+| Transfer hook authority | None from creation — required by the program |
 | Metadata | Name, symbol and uri readable on-chain |
 | Metadata update authority | Revoked — name/symbol/image are immutable |
 | Transfer fee (if `--fee-bps`) | Set, with its config authority revoked so the rate is permanent |
@@ -234,8 +238,9 @@ lives on the mint itself, so wallets, explorers and DEX aggregators resolve it
 with no Metaplex account. Point `--uri` at a JSON file shaped like
 [`metadata-example.json`](metadata-example.json).
 
-Revoking the transfer hook authority is **not optional**. The test suite includes
-a mutation check showing that if it survives, the hook can be repointed at a
+The hook authority must be `null` from mint creation — the program enforces
+this and will refuse to initialise otherwise. The test suite includes a mutation
+check showing why: if that authority survives, the hook can be repointed at a
 no-op program and the market-hours restriction disappears entirely.
 
 ### 3. Burn the program upgrade authority
