@@ -10,6 +10,7 @@
 import { Connection, PublicKey, clusterApiUrl } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
   ExtensionType,
   getMint,
   getExtensionData,
@@ -38,13 +39,28 @@ async function main() {
   const info = await connection.getAccountInfo(mintAddress);
   if (!info) throw new Error(`mint ${mintAddress.toBase58()} not found on ${cluster}`);
   const isToken2022 = info.owner.equals(TOKEN_2022_PROGRAM_ID);
+  const isLegacyToken = info.owner.equals(TOKEN_PROGRAM_ID);
+
+  const kind = isToken2022
+    ? "Token-2022"
+    : isLegacyToken
+      ? "legacy SPL Token"
+      : info.executable
+        ? "a PROGRAM, not a mint"
+        : "not owned by a token program";
 
   console.log(`mint     ${mintAddress.toBase58()}`);
   console.log(`cluster  ${cluster}`);
-  console.log(`owner    ${info.owner.toBase58()}${isToken2022 ? " (Token-2022)" : " (legacy SPL Token)"}`);
+  console.log(`owner    ${info.owner.toBase58()} (${kind})`);
 
   if (!isToken2022) {
-    console.log("\nNot a Token-2022 mint, so it carries no transfer hook. Nothing to check.");
+    if (isLegacyToken) {
+      console.log("\nLegacy SPL Token mint: it cannot carry a transfer hook. Nothing to check.");
+    } else if (info.executable) {
+      console.log("\nThis address is a deployed program. Pass a mint address instead.");
+    } else {
+      console.log("\nThis address is not a token mint. Pass a mint address instead.");
+    }
     return;
   }
 
