@@ -28,6 +28,8 @@ import {
   createApproveInstruction,
   createRevokeInstruction,
   createSetAuthorityInstruction,
+  createInitializeTransferFeeConfigInstruction,
+  getTransferFeeConfig,
   createUpdateTransferHookInstruction,
   AuthorityType,
   unpackMint,
@@ -951,5 +953,135 @@ describe("launch configuration: fixed supply, immutable hook and metadata", () =
 
   it("supply stays constant across all of it", () => {
     expect(mintSupply()).to.equal(SUPPLY);
+  });
+});
+
+/**
+ * A trading fee alongside the hook.
+ *
+ * Token-2022's TransferFeeConfig withholds a percentage on every transfer. It
+ * is independent of the hook, so the two must be checked together: the fee
+ * must actually be charged in session, and the hook must still block outside
+ * it (with no fee taken, since nothing moves).
+ */
+describe("transfer fee plus the NYSE hook", () => {
+  const FEE_BPS = 100; // 1%
+  let svm: LiteSVM;
+  let payer: Keypair;
+  let mint: Keypair;
+  let extraMetas: PublicKey;
+  let source: PublicKey;
+  let destination: PublicKey;
+
+  const setClock = (ts: bigint) => { const c = svm.getClock(); c.unixTimestamp = ts; svm.setClock(c); };
+  function send(ixs: TransactionInstruction[], signers: Keypair[]) {
+    svm.expireBlockhash();
+    const tx = new Transaction();
+    tx.recentBlockhash = svm.latestBlockhash();
+    tx.feePayer = payer.publicKey;
+    ixs.forEach((i) => tx.add(i));
+    tx.sign(payer, ...signers);
+    return svm.sendTransaction(tx);
+  }
+  function rawBalance(a: PublicKey): bigint {
+    const info = svm.getAccount(a);
+    if (!info) throw new Error("missing account");
+    return Buffer.from(info.data).readBigUInt64LE(64);
+  }
+  function transferIx(amount: bigint) {
+    const ix = createTransferCheckedInstruction(
+      source, mint.publicKey, destination, payer.publicKey, amount, DECIMALS, [], TOKEN_2022_PROGRAM_ID
+    );
+    ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
+    ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+    return ix;
+  }
+
+  before(() => {
+    svm = new LiteSVM().withBuiltins().withSplPrograms().withSysvars();
+    svm.addProgramFromFile(PROGRAM_ID, SO_PATH);
+    payer = Keypair.generate();
+    const holder = Keypair.generate();
+    mint = Keypair.generate();
+    svm.airdrop(payer.publicKey, 100_000_000_000n);
+    setClock(T.openRegular.ts);
+
+    [extraMetas] = PublicKey.findProgramAddressSync(
+      [Buffer.from("extra-account-metas"), mint.publicKey.toBuffer()], PROGRAM_ID
+    );
+    const mintLen = getMintLen([ExtensionType.TransferFeeConfig, ExtensionType.TransferHook]);
+    const created = send([
+      SystemProgram.createAccount({
+        fromPubkey: payer.publicKey, newAccountPubkey: mint.publicKey, space: mintLen,
+        lamports: Number(svm.minimumBalanceForRentExemption(BigInt(mintLen))),
+        programId: TOKEN_2022_PROGRAM_ID,
+      }),
+      createInitializeTransferFeeConfigInstruction(
+        mint.publicKey, null, payer.publicKey, FEE_BPS, (1n << 64n) - 1n, TOKEN_2022_PROGRAM_ID
+      ),
+      createInitializeTransferHookInstruction(mint.publicKey, payer.publicKey, PROGRAM_ID, TOKEN_2022_PROGRAM_ID),
+      createInitializeMintInstruction(mint.publicKey, DECIMALS, payer.publicKey, null, TOKEN_2022_PROGRAM_ID),
+    ], [mint]);
+    expect(created instanceof FailedTransactionMetadata,
+      `mint creation failed: ${created instanceof FailedTransactionMetadata ? created.err().toString() : ""}`).to.be.false;
+
+    send([{
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+        { pubkey: extraMetas, isSigner: false, isWritable: true },
+        { pubkey: mint.publicKey, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: anchorDiscriminator("initialize_extra_account_meta_list"),
+    } as TransactionInstruction], [payer]);
+
+    source = getAssociatedTokenAddressSync(mint.publicKey, payer.publicKey, false, TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+    destination = getAssociatedTokenAddressSync(mint.publicKey, holder.publicKey, false, TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+    send([
+      createAssociatedTokenAccountInstruction(payer.publicKey, source, payer.publicKey, mint.publicKey, TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID),
+      createAssociatedTokenAccountInstruction(payer.publicKey, destination, holder.publicKey, mint.publicKey, TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID),
+      createMintToInstruction(mint.publicKey, source, payer.publicKey, 1_000_000_000_000n, [], TOKEN_2022_PROGRAM_ID),
+    ], [payer]);
+  });
+
+  it("charges the fee on a transfer during market hours", () => {
+    setClock(T.openRegular.ts);
+    const before = rawBalance(destination);
+    const amount = 1_000_000n;
+    const r = send([transferIx(amount)], [payer]);
+    expect(r instanceof FailedTransactionMetadata,
+      `transfer failed: ${r instanceof FailedTransactionMetadata ? r.err().toString() : ""}`).to.be.false;
+    // 1% is withheld, so the recipient's spendable balance rises by 99%.
+    const expectedFee = (amount * BigInt(FEE_BPS)) / 10_000n;
+    expect(rawBalance(destination) - before).to.equal(amount - expectedFee);
+  });
+
+  it("takes no fee when the hook blocks the transfer", () => {
+    setClock(T.weekend.ts);
+    const srcBefore = rawBalance(source);
+    const dstBefore = rawBalance(destination);
+    const r = send([transferIx(1_000_000n)], [payer]);
+    expect(r instanceof FailedTransactionMetadata, "weekend transfer should be blocked").to.be.true;
+    expect(rawBalance(source), "no fee taken from source").to.equal(srcBefore);
+    expect(rawBalance(destination), "destination unchanged").to.equal(dstBefore);
+  });
+
+  it("locks the fee rate permanently", () => {
+    const info = svm.getAccount(mint.publicKey);
+    if (!info) throw new Error("missing mint");
+    const decoded = unpackMint(
+      mint.publicKey,
+      { ...info, data: Buffer.from(info.data), owner: new PublicKey(info.owner) } as any,
+      TOKEN_2022_PROGRAM_ID
+    );
+    const fee = getTransferFeeConfig(decoded);
+    expect(fee, "fee config present").to.not.be.null;
+    expect(fee!.newerTransferFee.transferFeeBasisPoints).to.equal(FEE_BPS);
+    expect(
+      fee!.transferFeeConfigAuthority === null ||
+        fee!.transferFeeConfigAuthority.equals(PublicKey.default),
+      "fee config authority must be revoked so the rate can never change"
+    ).to.be.true;
   });
 });

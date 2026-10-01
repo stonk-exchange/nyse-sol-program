@@ -90,7 +90,7 @@ npm run gen:table      # regenerate the table
 A differential of the implementation against tzdata over 525,888 five-minute
 slots spanning 2026–2031 matches exactly.
 
-**33 integration tests** running the compiled program under LiteSVM with a
+**36 integration tests** running the compiled program under LiteSVM with a
 controlled clock. They attempt real Token-2022 transfers at each market state
 and assert on the on-chain error code and token balances, and cover the launch
 configuration, delegated transfers, the session boundaries to the second, and
@@ -206,8 +206,14 @@ authority in the same transaction. It dry-runs by default:
 ```bash
 ANCHOR_WALLET=~/.config/solana/id.json npx ts-node scripts/launch-token.ts \
   --cluster devnet --name "STONKS" --symbol STONKS \
-  --uri https://example.com/metadata.json --supply 1000000 --decimals 9
+  --uri https://example.com/metadata.json --supply 1000000 --decimals 9 \
+  --fee-bps 100
 ```
+
+`--fee-bps` adds a Token-2022 `TransferFeeConfig`: a percentage withheld on
+every transfer. Its config authority is revoked at launch so the rate can never
+be changed, while the withdraw-withheld authority stays with the launch wallet
+so accrued fees can be harvested. Omit the flag for no fee.
 
 Add `--execute` to send. Afterwards it reads the mint back from chain and
 verifies:
@@ -221,6 +227,7 @@ verifies:
 | Transfer hook authority | Revoked — the hook can never be repointed |
 | Metadata | Name, symbol and uri readable on-chain |
 | Metadata update authority | Revoked — name/symbol/image are immutable |
+| Transfer fee (if `--fee-bps`) | Set, with its config authority revoked so the rate is permanent |
 
 Metadata uses the Token-2022 `MetadataPointer` + `TokenMetadata` extensions and
 lives on the mint itself, so wallets, explorers and DEX aggregators resolve it
