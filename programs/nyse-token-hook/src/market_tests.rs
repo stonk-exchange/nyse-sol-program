@@ -42,6 +42,7 @@ pub fn nyse_schedule() -> Schedule {
         ],
         // NYSE half-days are deliberately not enforced.
         early_closes: vec![],
+        events: vec![],
     }
 }
 
@@ -101,6 +102,7 @@ fn eu_dst_transitions_are_exact() {
         windows: vec![Window { days_mask: 0b0111110, open_minute: 480, close_minute: 990 }],
         holidays: vec![],
         early_closes: vec![],
+        events: vec![],
     };
     // Last Sunday in March / October at 01:00 UTC.
     for (year, m_start, d_start, m_end, d_end) in
@@ -125,6 +127,7 @@ fn a_market_with_no_dst_never_shifts() {
         windows: vec![Window { days_mask: 0b0111110, open_minute: 540, close_minute: 900 }],
         holidays: vec![],
         early_closes: vec![],
+        events: vec![],
     };
     for ts in [1_772_953_200i64, 1_793_512_800, 1_805_007_600] {
         assert!(!tokyo.is_dst(ts));
@@ -140,6 +143,7 @@ fn schedule_args_are_validated() {
         windows: vec![Window { days_mask: 0b0111110, open_minute: 570, close_minute: 960 }],
         holidays: vec![1, 2, 3],
         early_closes: vec![],
+        events: vec![],
     };
     assert!(ok.validate().is_ok());
 
@@ -311,4 +315,74 @@ fn holidays_outside_the_horizon_do_not_block() {
     let last = s.base_day as i64 + *s.holidays.last().unwrap() as i64;
     let (y, _, _) = civil_from_days(last);
     assert!(y >= 2046, "holiday horizon should reach at least 2046, got {y}");
+}
+
+#[test]
+fn events_override_the_weekly_windows() {
+    let mut s = nyse_schedule();
+    // Mon 2026-09-28, 11:00 ET -- normally open.
+    let midsession = 1_790_607_600i64;
+    // Sat 2026-10-03, 11:00 ET -- normally closed.
+    let weekend = 1_791_039_600i64;
+    assert_eq!(s.state_at(midsession), MarketState::Open);
+    assert_eq!(s.state_at(weekend), MarketState::Closed);
+
+    // A deny event shuts an otherwise-open session.
+    s.events = vec![Event { start: midsession - 600, end: midsession + 600, allow: false }];
+    assert_eq!(s.state_at(midsession), MarketState::Closed);
+    assert_eq!(s.state_at(midsession + 1_200), MarketState::Open, "outside the event, normal rules");
+
+    // An allow event opens an otherwise-closed weekend.
+    s.events = vec![Event { start: weekend - 600, end: weekend + 600, allow: true }];
+    assert_eq!(s.state_at(weekend), MarketState::Open);
+    assert_eq!(s.state_at(weekend + 1_200), MarketState::Closed);
+}
+
+#[test]
+fn a_deny_event_beats_an_overlapping_allow() {
+    let mut s = nyse_schedule();
+    let t = 1_791_039_600i64; // Saturday
+    s.events = vec![
+        Event { start: t - 600, end: t + 600, allow: true },
+        Event { start: t - 300, end: t + 300, allow: false },
+    ];
+    assert_eq!(s.state_at(t), MarketState::Closed, "deny must win");
+    assert_eq!(s.state_at(t + 450), MarketState::Open, "only the allow covers this instant");
+}
+
+#[test]
+fn an_allow_event_also_overrides_a_holiday() {
+    let mut s = nyse_schedule();
+    let christmas = 1_798_214_400i64; // 2026-12-25 11:00 ET
+    assert_eq!(s.state_at(christmas), MarketState::Holiday);
+    s.events = vec![Event { start: christmas - 60, end: christmas + 60, allow: true }];
+    assert_eq!(s.state_at(christmas), MarketState::Open);
+}
+
+#[test]
+fn malformed_events_are_rejected() {
+    let base = ScheduleArgs {
+        tz_offset_minutes: -300,
+        dst_rule: DST_US,
+        base_day: 20454,
+        windows: vec![Window { days_mask: 0b0111110, open_minute: 570, close_minute: 960 }],
+        holidays: vec![],
+        early_closes: vec![],
+        events: vec![],
+    };
+    assert!(base.validate().is_ok());
+
+    let backwards = ScheduleArgs {
+        events: vec![Event { start: 100, end: 100, allow: true }],
+        ..base.clone()
+    };
+    assert!(backwards.validate().is_err(), "a zero-length event must be rejected");
+
+    let too_many = ScheduleArgs {
+        events: (0..MAX_EVENTS as i64 + 1)
+            .map(|i| Event { start: i * 10, end: i * 10 + 5, allow: true })
+            .collect(),
+        ..base
+    };
+    assert!(too_many.validate().is_err());
 }

@@ -8,6 +8,16 @@ export const HOOK_PROGRAM_ID = new PublicKey("CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkb
 export const scheduleAddress = (mint: PublicKey) =>
   PublicKey.findProgramAddressSync([Buffer.from("schedule"), mint.toBuffer()], HOOK_PROGRAM_ID)[0];
 
+export const registryAddress = () =>
+  PublicKey.findProgramAddressSync([Buffer.from("registry")], HOOK_PROGRAM_ID)[0];
+
+/** A market is approved by the existence of the PDA for its schedule hash. */
+export const marketAddress = (scheduleHash: Buffer) =>
+  PublicKey.findProgramAddressSync([Buffer.from("market"), scheduleHash], HOOK_PROGRAM_ID)[0];
+
+export const scheduleHash = (m: Market) =>
+  createHash("sha256").update(encodeScheduleForHash(m)).digest();
+
 export const extraAccountMetasAddress = (mint: PublicKey) =>
   PublicKey.findProgramAddressSync(
     [Buffer.from("extra-account-metas"), mint.toBuffer()],
@@ -43,6 +53,10 @@ export function encodeScheduleForHash(m: Market): Buffer {
   parts.push(u32(m.earlyCloses.length));
   for (const e of m.earlyCloses) parts.push(u16(e.dayOffset), u16(e.closeMinute));
 
+  const i64 = (v: number) => { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(v)); return b; };
+  parts.push(u32(m.events.length));
+  for (const e of m.events) parts.push(i64(e.start), i64(e.end), Buffer.from([e.allow ? 1 : 0]));
+
   return Buffer.concat(parts);
 }
 
@@ -57,18 +71,61 @@ export function encodeScheduleForHash(m: Market): Buffer {
 export function initializeScheduleIx(
   mint: PublicKey,
   payer: PublicKey,
-  market: Market
+  market: Market,
+  /** Pass true for a market approved via the registry rather than compiled in. */
+  viaRegistry = false
 ): TransactionInstruction {
+  const keys = [
+    { pubkey: payer, isSigner: true, isWritable: true },
+    { pubkey: scheduleAddress(mint), isSigner: false, isWritable: true },
+    { pubkey: extraAccountMetasAddress(mint), isSigner: false, isWritable: true },
+    { pubkey: mint, isSigner: false, isWritable: false },
+  ];
+  // Anchor signals an absent optional account by passing the program id in
+  // its slot, so the slot is always present.
+  keys.push({
+    pubkey: viaRegistry ? marketAddress(scheduleHash(market)) : HOOK_PROGRAM_ID,
+    isSigner: false,
+    isWritable: false,
+  });
+  keys.push({ pubkey: SystemProgram.programId, isSigner: false, isWritable: false });
+  return new TransactionInstruction({
+    programId: HOOK_PROGRAM_ID,
+    keys,
+    data: Buffer.concat([discriminator("initialize"), encodeScheduleForHash(market)]),
+  });
+}
+
+/** Create the market registry. Only REGISTRY_BOOTSTRAP may send this. */
+export function initializeRegistryIx(payer: PublicKey, authority: PublicKey): TransactionInstruction {
   return new TransactionInstruction({
     programId: HOOK_PROGRAM_ID,
     keys: [
       { pubkey: payer, isSigner: true, isWritable: true },
-      { pubkey: scheduleAddress(mint), isSigner: false, isWritable: true },
-      { pubkey: extraAccountMetasAddress(mint), isSigner: false, isWritable: true },
-      { pubkey: mint, isSigner: false, isWritable: false },
+      { pubkey: registryAddress(), isSigner: false, isWritable: true },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
-    data: Buffer.concat([discriminator("initialize"), encodeScheduleForHash(market)]),
+    data: Buffer.concat([discriminator("initialize_registry"), authority.toBuffer()]),
+  });
+}
+
+/** Approve a market, so future tokens may launch with it. */
+export function registerMarketIx(
+  payer: PublicKey,
+  authority: PublicKey,
+  m: Market
+): TransactionInstruction {
+  const hash = scheduleHash(m);
+  return new TransactionInstruction({
+    programId: HOOK_PROGRAM_ID,
+    keys: [
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: authority, isSigner: true, isWritable: false },
+      { pubkey: registryAddress(), isSigner: false, isWritable: false },
+      { pubkey: marketAddress(hash), isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.concat([discriminator("register_market"), hash]),
   });
 }
 

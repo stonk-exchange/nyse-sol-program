@@ -9,6 +9,8 @@ export const DstRule = { None: 0, US: 1, EU: 2 } as const;
 
 export type Window = { daysMask: number; openMinute: number; closeMinute: number };
 export type EarlyClose = { dayOffset: number; closeMinute: number };
+/** Absolute-time override. Deny beats allow; both bounds are unix seconds. */
+export type Event = { start: number; end: number; allow: boolean };
 export type Market = {
   id: string;
   label: string;
@@ -18,6 +20,7 @@ export type Market = {
   windows: Window[];
   holidays: number[];
   earlyCloses: EarlyClose[];
+  events: Event[];
 };
 
 /** Monday to Friday. Bit 0 is Sunday. */
@@ -47,6 +50,7 @@ export const MARKETS: Record<string, Market> = {
       7109, 7124, 7186, 7266, 7298, 7305, 7319, 7354, 7386, 7452, 7474, 7489, 7550, 7630, 7663,
     ],
     earlyCloses: [],
+    events: [],
   },
 };
 

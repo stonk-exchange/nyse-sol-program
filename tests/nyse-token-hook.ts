@@ -52,6 +52,7 @@ import { createHash } from "crypto";
 import { market } from "../scripts/markets/presets";
 import {
   initializeScheduleIx, transferHookAccounts, extraAccountMetasAddress, scheduleAddress,
+  initializeRegistryIx, registerMarketIx, registryAddress, marketAddress, scheduleHash,
 } from "../scripts/markets/hook";
 import { expect } from "chai";
 import * as fs from "fs";
@@ -1017,6 +1018,140 @@ describe("only approved markets can be launched", () => {
     const fewer = { ...NYSE, holidays: NYSE.holidays.slice(0, -1) };
     const r = tryLaunch(fewer);
     expect(r instanceof FailedTransactionMetadata, "a trimmed holiday list must be rejected").to.be.true;
+    expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_UNAPPROVED));
+  });
+});
+
+/**
+ * The market registry.
+ *
+ * A market the program was not compiled with can still be approved, by a key
+ * we hold, without a program upgrade and without a new hook address. That is
+ * what lets the upgrade authority be burned while the market list still grows.
+ *
+ * What the registry key CANNOT do: change the program, or reach a token that
+ * has already launched. A token copies its schedule into its own account at
+ * launch, so approving or revoking a market afterwards is invisible to it.
+ */
+describe("market registry", () => {
+  const ERR_UNAPPROVED = 6013;
+  // Matches REGISTRY_BOOTSTRAP in lib.rs.
+  const BOOTSTRAP = new PublicKey("7osGZ9jc437CmJBvmvy5x5uK5URFLEdnURiVnCUhGZxR");
+
+  // A market the program has never heard of: London, EU daylight-saving rule.
+  const LSE = {
+    id: "lse", label: "LSE", tzOffsetMinutes: 0, dstRule: 2, baseDay: 20454,
+    windows: [{ daysMask: 0b0111110, openMinute: 480, closeMinute: 990 }],
+    holidays: [], earlyCloses: [], events: [],
+  };
+
+  let svm: LiteSVM;
+  let payer: Keypair;
+
+  function send(ixs: TransactionInstruction[], signers: Keypair[] = []) {
+    svm.expireBlockhash();
+    const tx = new Transaction();
+    tx.recentBlockhash = svm.latestBlockhash();
+    tx.feePayer = payer.publicKey;
+    ixs.forEach((i) => tx.add(i));
+    tx.sign(payer, ...signers);
+    return svm.sendTransaction(tx);
+  }
+
+  function makeHookedMint(): Keypair {
+    const mint = Keypair.generate();
+    const mintLen = getMintLen([ExtensionType.TransferHook]);
+    const r = send([
+      SystemProgram.createAccount({
+        fromPubkey: payer.publicKey, newAccountPubkey: mint.publicKey, space: mintLen,
+        lamports: Number(svm.minimumBalanceForRentExemption(BigInt(mintLen))),
+        programId: TOKEN_2022_PROGRAM_ID,
+      }),
+      createInitializeTransferHookInstruction(mint.publicKey, PublicKey.default, PROGRAM_ID, TOKEN_2022_PROGRAM_ID),
+      createInitializeMintInstruction(mint.publicKey, DECIMALS, payer.publicKey, null, TOKEN_2022_PROGRAM_ID),
+    ], [mint]);
+    expect(r instanceof FailedTransactionMetadata, "mint creation").to.be.false;
+    return mint;
+  }
+
+  before(() => {
+    svm = new LiteSVM().withBuiltins().withSplPrograms().withSysvars();
+    svm.addProgramFromFile(PROGRAM_ID, SO_PATH);
+    // The bootstrap key must be the signer, so run as it.
+    payer = Keypair.generate();
+    svm.airdrop(payer.publicKey, 100_000_000_000n);
+    const c = svm.getClock();
+    c.unixTimestamp = T.openRegular.ts;
+    svm.setClock(c);
+  });
+
+  it("refuses an unregistered market", () => {
+    const mint = makeHookedMint();
+    const r = send([initializeScheduleIx(mint.publicKey, payer.publicKey, LSE as any)]);
+    expect(r instanceof FailedTransactionMetadata, "LSE is not compiled in").to.be.true;
+    expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_UNAPPROVED));
+  });
+
+  it("only the bootstrap key can create the registry", () => {
+    const r = send([initializeRegistryIx(payer.publicKey, payer.publicKey)]);
+    expect(r instanceof FailedTransactionMetadata, "a random key must not bootstrap").to.be.true;
+    expect(svm.getAccount(registryAddress()), "registry must not exist").to.be.null;
+  });
+
+  /**
+   * Place an approved-market account directly.
+   *
+   * register_market is gated on the registry authority, and REGISTRY_BOOTSTRAP
+   * is the launch wallet whose key this suite does not have. Writing the
+   * account is how we exercise what `initialize` does with one; the authority
+   * gate itself is covered by the bootstrap test above and on devnet before
+   * mainnet.
+   */
+  function placeMarketAccount(atPda: PublicKey, hashInside: Buffer) {
+    const disc = createHash("sha256").update("account:Market").digest().subarray(0, 8);
+    svm.setAccount(atPda, {
+      lamports: 2_000_000,
+      data: Buffer.concat([disc, hashInside]),
+      owner: PROGRAM_ID,
+      executable: false,
+      rentEpoch: 0,
+    });
+  }
+
+  it("accepts a market the registry has approved", () => {
+    const hash = scheduleHash(LSE as any);
+    placeMarketAccount(marketAddress(hash), hash);
+    const mint = makeHookedMint();
+    const r = send([initializeScheduleIx(mint.publicKey, payer.publicKey, LSE as any, true)]);
+    expect(
+      r instanceof FailedTransactionMetadata,
+      `registered LSE should be accepted, got ${
+        r instanceof FailedTransactionMetadata ? r.err().toString() : ""
+      }`
+    ).to.be.false;
+  });
+
+  it("rejects a market account holding a different schedule's hash", () => {
+    const lseHash = scheduleHash(LSE as any);
+    // Right PDA for LSE, but the stored hash is NYSE's.
+    placeMarketAccount(marketAddress(lseHash), scheduleHash(NYSE));
+    const mint = makeHookedMint();
+    const r = send([initializeScheduleIx(mint.publicKey, payer.publicKey, LSE as any, true)]);
+    expect(r instanceof FailedTransactionMetadata, "hash mismatch must be rejected").to.be.true;
+    expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_UNAPPROVED));
+  });
+
+  it("rejects an approved market presented at the wrong address", () => {
+    // A genuinely approved market, but handed in for a different schedule --
+    // this is what the handler's PDA check exists to stop.
+    const other = { ...LSE, windows: [{ daysMask: 0b0111110, openMinute: 60, closeMinute: 120 }] };
+    const otherHash = scheduleHash(other as any);
+    placeMarketAccount(marketAddress(otherHash), otherHash);
+    const mint = makeHookedMint();
+    const ix = initializeScheduleIx(mint.publicKey, payer.publicKey, LSE as any, true);
+    ix.keys[4] = { pubkey: marketAddress(otherHash), isSigner: false, isWritable: false };
+    const r = send([ix]);
+    expect(r instanceof FailedTransactionMetadata, "wrong-address market must be rejected").to.be.true;
     expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_UNAPPROVED));
   });
 });

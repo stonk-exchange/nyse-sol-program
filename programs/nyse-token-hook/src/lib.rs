@@ -40,14 +40,22 @@ pub const DST_EU: u8 = 2;
 const ALLOWED_SCHEDULES: [[u8; 32]; 1] = [
     // NYSE, 09:30-16:00 ET Mon-Fri, US DST, holidays through 2046-12-25.
     [
-        173, 212, 161, 120, 11, 80, 175, 95, 61, 135, 57, 116, 69, 249, 194, 78, 236, 126, 184,
-        238, 15, 64, 17, 224, 198, 26, 74, 84, 187, 78, 216, 174,
+        41, 177, 105, 54, 84, 251, 12, 232, 255, 202, 153, 77, 219, 30, 87, 182, 245, 187, 192,
+        203, 107, 49, 40, 69, 235, 250, 219, 12, 142, 154, 237, 65,
     ],
 ];
 
 const MAX_WINDOWS: usize = 14;
 const MAX_HOLIDAYS: usize = 256;
 const MAX_EARLY_CLOSES: usize = 64;
+const MAX_EVENTS: usize = 64;
+
+/// Bootstraps the market registry. Only this key can create the registry
+/// account, after which the authority it names takes over and can be rotated.
+///
+/// MUST be set to the launch wallet before mainnet deploy: whoever holds it
+/// decides which markets exist.
+pub const REGISTRY_BOOTSTRAP: Pubkey = pubkey!("7osGZ9jc437CmJBvmvy5x5uK5URFLEdnURiVnCUhGZxR");
 
 #[program]
 pub mod nyse_token_hook {
@@ -61,7 +69,16 @@ pub mod nyse_token_hook {
     /// cannot affect a token that has already launched.
     pub fn initialize(ctx: Context<Initialize>, args: ScheduleArgs) -> Result<()> {
         args.validate()?;
-        args.assert_is_an_approved_market()?;
+        // If a registry entry was supplied, it must be the PDA for this exact
+        // schedule -- otherwise any registered market would approve any
+        // schedule.
+        if let Some(m) = ctx.accounts.market.as_ref() {
+            let digest = anchor_lang::solana_program::hash::hash(&args.try_to_vec()?).to_bytes();
+            let (expected, _) =
+                Pubkey::find_program_address(&[b"market", digest.as_ref()], &crate::ID);
+            require_keys_eq!(m.key(), expected, HookError::UnapprovedMarket);
+        }
+        args.assert_is_an_approved_market(ctx.accounts.market.as_deref())?;
 
         let s = &mut ctx.accounts.schedule;
         s.mint = ctx.accounts.mint.key();
@@ -71,6 +88,7 @@ pub mod nyse_token_hook {
         s.windows = args.windows;
         s.holidays = args.holidays;
         s.early_closes = args.early_closes;
+        s.events = args.events;
 
         // Token-2022 must pass the schedule account on every transfer.
         let account_metas = vec![ExtraAccountMeta::new_with_seeds(
@@ -89,6 +107,39 @@ pub mod nyse_token_hook {
         )?;
 
         msg!("schedule written for mint {}", s.mint);
+        Ok(())
+    }
+
+    /// Create the market registry. Callable once, by REGISTRY_BOOTSTRAP.
+    pub fn initialize_registry(ctx: Context<InitializeRegistry>, authority: Pubkey) -> Result<()> {
+        ctx.accounts.registry.authority = authority;
+        msg!("market registry authority: {}", authority);
+        Ok(())
+    }
+
+    /// Hand the registry to a different key.
+    pub fn set_registry_authority(
+        ctx: Context<RegistryAdmin>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        ctx.accounts.registry.authority = new_authority;
+        Ok(())
+    }
+
+    /// Approve a market so tokens may launch with it.
+    ///
+    /// This is the whole point of the registry: a new market is new DATA, so
+    /// it needs no program upgrade and no new hook address. Approving or
+    /// revoking one affects only FUTURE launches -- a token's schedule is
+    /// copied into its own account at launch and nothing here can reach it.
+    pub fn register_market(ctx: Context<RegisterMarket>, schedule_hash: [u8; 32]) -> Result<()> {
+        ctx.accounts.market.schedule_hash = schedule_hash;
+        msg!("market approved: {}", hex32(&schedule_hash));
+        Ok(())
+    }
+
+    /// Stop new tokens launching with a market. Existing tokens are untouched.
+    pub fn revoke_market(_ctx: Context<RevokeMarket>, _schedule_hash: [u8; 32]) -> Result<()> {
         Ok(())
     }
 
@@ -148,6 +199,90 @@ fn assert_is_transferring(account_info: &AccountInfo) -> Result<()> {
 // Accounts
 // ---------------------------------------------------------------------------
 
+#[account]
+pub struct Registry {
+    pub authority: Pubkey,
+}
+
+#[account]
+pub struct Market {
+    pub schedule_hash: [u8; 32],
+}
+
+#[derive(Accounts)]
+pub struct InitializeRegistry<'info> {
+    #[account(mut, address = REGISTRY_BOOTSTRAP @ HookError::NotRegistryAuthority)]
+    pub payer: Signer<'info>,
+
+    #[account(init, payer = payer, space = 8 + 32, seeds = [b"registry"], bump)]
+    pub registry: Account<'info, Registry>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RegistryAdmin<'info> {
+    #[account(address = registry.authority @ HookError::NotRegistryAuthority)]
+    pub authority: Signer<'info>,
+
+    #[account(mut, seeds = [b"registry"], bump)]
+    pub registry: Account<'info, Registry>,
+}
+
+#[derive(Accounts)]
+#[instruction(schedule_hash: [u8; 32])]
+pub struct RegisterMarket<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(address = registry.authority @ HookError::NotRegistryAuthority)]
+    pub authority: Signer<'info>,
+
+    #[account(seeds = [b"registry"], bump)]
+    pub registry: Account<'info, Registry>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + 32,
+        seeds = [b"market", schedule_hash.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(schedule_hash: [u8; 32])]
+pub struct RevokeMarket<'info> {
+    #[account(address = registry.authority @ HookError::NotRegistryAuthority)]
+    pub authority: Signer<'info>,
+
+    #[account(seeds = [b"registry"], bump)]
+    pub registry: Account<'info, Registry>,
+
+    /// CHECK: closed, rent returned to the authority.
+    #[account(
+        mut,
+        close = authority,
+        seeds = [b"market", schedule_hash.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+}
+
+/// Lowercase hex, for log messages.
+fn hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[derive(Accounts)]
 #[instruction(args: ScheduleArgs)]
 pub struct Initialize<'info> {
@@ -161,6 +296,7 @@ pub struct Initialize<'info> {
             args.windows.len(),
             args.holidays.len(),
             args.early_closes.len(),
+            args.events.len(),
         ),
         seeds = [b"schedule", mint.key().as_ref()],
         bump
@@ -179,6 +315,11 @@ pub struct Initialize<'info> {
 
     /// CHECK: only used for PDA derivation and recorded on the schedule.
     pub mint: AccountInfo<'info>,
+
+    /// Needed only for a market that is registered rather than compiled in.
+    /// Its address is checked against the schedule hash in the handler, since
+    /// a seeds constraint cannot run the fallible encoding.
+    pub market: Option<Account<'info, Market>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -221,6 +362,21 @@ pub struct Window {
     pub close_minute: u16,
 }
 
+/// An absolute-time override, evaluated before the weekly windows.
+///
+/// Both bounds are unix seconds. A `deny` event closes the market for that
+/// span whatever the windows say; an `allow` event opens it. Deny wins if two
+/// overlap. Because a schedule is immutable, events must be known at launch:
+/// they cannot be used to react to an unscheduled closure later.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub start: i64,
+    /// Exclusive.
+    pub end: i64,
+    /// true opens the market for the span, false closes it.
+    pub allow: bool,
+}
+
 /// A day that closes earlier than its window would allow.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EarlyClose {
@@ -240,18 +396,27 @@ pub struct ScheduleArgs {
     /// Full closures, as days after `base_day`, sorted ascending.
     pub holidays: Vec<u16>,
     pub early_closes: Vec<EarlyClose>,
+    pub events: Vec<Event>,
 }
 
 impl ScheduleArgs {
-    /// Reject any schedule that is not one of the compiled-in markets.
-    fn assert_is_an_approved_market(&self) -> Result<()> {
-        let encoded = self.try_to_vec()?;
-        let digest = anchor_lang::solana_program::hash::hash(&encoded).to_bytes();
-        require!(
-            ALLOWED_SCHEDULES.iter().any(|h| *h == digest),
-            HookError::UnapprovedMarket
-        );
-        Ok(())
+    /// Reject any schedule that is neither compiled in nor registered.
+    ///
+    /// Two sources of truth, deliberately. The compiled list means the
+    /// launch market keeps working even if the registry key is lost; the
+    /// registry means later markets need no new program.
+    fn assert_is_an_approved_market(&self, market: Option<&Market>) -> Result<()> {
+        let digest = anchor_lang::solana_program::hash::hash(&self.try_to_vec()?).to_bytes();
+
+        if ALLOWED_SCHEDULES.iter().any(|h| *h == digest) {
+            return Ok(());
+        }
+        if let Some(m) = market {
+            if m.schedule_hash == digest {
+                return Ok(());
+            }
+        }
+        err!(HookError::UnapprovedMarket)
     }
 
     fn validate(&self) -> Result<()> {
@@ -262,6 +427,10 @@ impl ScheduleArgs {
             self.early_closes.len() <= MAX_EARLY_CLOSES,
             HookError::TooManyEarlyCloses
         );
+        require!(self.events.len() <= MAX_EVENTS, HookError::TooManyEvents);
+        for e in &self.events {
+            require!(e.start < e.end, HookError::InvalidEvent);
+        }
         require!(self.dst_rule <= DST_EU, HookError::InvalidDstRule);
         require!(
             self.tz_offset_minutes >= -720 && self.tz_offset_minutes <= 840,
@@ -290,10 +459,16 @@ pub struct Schedule {
     pub windows: Vec<Window>,
     pub holidays: Vec<u16>,
     pub early_closes: Vec<EarlyClose>,
+    pub events: Vec<Event>,
 }
 
 impl Schedule {
-    pub fn space(windows: usize, holidays: usize, early_closes: usize) -> usize {
+    pub fn space(
+        windows: usize,
+        holidays: usize,
+        early_closes: usize,
+        events: usize,
+    ) -> usize {
         8  // discriminator
         + 32 // mint
         + 2  // tz_offset_minutes
@@ -302,10 +477,25 @@ impl Schedule {
         + 4 + windows * 5
         + 4 + holidays * 2
         + 4 + early_closes * 4
+        + 4 + events * 17
     }
 
     /// Market state at a UTC timestamp.
     pub fn state_at(&self, utc_ts: i64) -> MarketState {
+        // Absolute-time overrides come first. A deny beats an allow.
+        let mut allowed_by_event = false;
+        for e in self.events.iter() {
+            if utc_ts >= e.start && utc_ts < e.end {
+                if !e.allow {
+                    return MarketState::Closed;
+                }
+                allowed_by_event = true;
+            }
+        }
+        if allowed_by_event {
+            return MarketState::Open;
+        }
+
         let offset_minutes = self.tz_offset_minutes as i64 + if self.is_dst(utc_ts) { 60 } else { 0 };
         let local = utc_ts + offset_minutes * 60;
 
@@ -422,6 +612,12 @@ pub enum HookError {
     HolidaysNotSorted,
     #[msg("schedule is not an approved market")]
     UnapprovedMarket,
+    #[msg("too many events")]
+    TooManyEvents,
+    #[msg("event is malformed")]
+    InvalidEvent,
+    #[msg("only the registry authority may do this")]
+    NotRegistryAuthority,
 }
 
 // ---------------------------------------------------------------------------
