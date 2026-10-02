@@ -17,8 +17,12 @@ export const extraAccountMetasAddress = (mint: PublicKey) =>
 const discriminator = (name: string) =>
   createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
 
-/** Borsh encoding of ScheduleArgs. */
-function encodeSchedule(m: Market): Buffer {
+/**
+ * Borsh encoding of ScheduleArgs. Exported because the program identifies an
+ * approved market by the sha256 of exactly these bytes, so the launcher and
+ * `npm run hash:markets` must agree byte for byte.
+ */
+export function encodeScheduleForHash(m: Market): Buffer {
   const parts: Buffer[] = [];
   const i16 = (v: number) => { const b = Buffer.alloc(2); b.writeInt16LE(v); return b; };
   const u16 = (v: number) => { const b = Buffer.alloc(2); b.writeUInt16LE(v); return b; };
@@ -64,7 +68,7 @@ export function initializeScheduleIx(
       { pubkey: mint, isSigner: false, isWritable: false },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
-    data: Buffer.concat([discriminator("initialize"), encodeSchedule(market)]),
+    data: Buffer.concat([discriminator("initialize"), encodeScheduleForHash(market)]),
   });
 }
 

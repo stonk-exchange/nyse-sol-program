@@ -18,7 +18,9 @@
     "dbc:token": "ts-node scripts/launch-dbc.ts token",
     "probe:mainnet": "ts-node scripts/probe-hooked-tokens.ts",
     "fetch:dbc": "./scripts/fetch-dbc-fixtures.sh",
-    "test:dbc": "ts-node scripts/dbc-test-harness.ts"
+    "test:dbc": "ts-node scripts/dbc-test-harness.ts",
+    "verify:deployment": "./scripts/verify-deployment.sh",
+    "hash:markets": "ts-node scripts/hash-markets.ts"
   },
   "dependencies": {
     "@metaplex-foundation/mpl-token-metadata": "^3.4.0",

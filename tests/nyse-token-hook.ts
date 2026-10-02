@@ -935,3 +935,88 @@ describe("launch configuration: fixed supply, immutable hook and metadata", () =
     expect(mintSupply()).to.equal(SUPPLY);
   });
 });
+
+/**
+ * A market is data, but not free-form data.
+ *
+ * The program hashes the submitted schedule and refuses anything that is not
+ * one of its compiled-in markets, so nobody -- including us -- can launch a
+ * token on this hook with hours of their own choosing. Once the upgrade
+ * authority is burned that list is fixed forever, and a new market means a new
+ * program with its own address.
+ */
+describe("only approved markets can be launched", () => {
+  const ERR_UNAPPROVED = 6013; // HookError::UnapprovedMarket
+
+  let svm: LiteSVM;
+  let payer: Keypair;
+
+  function send(ixs: TransactionInstruction[], signers: Keypair[]) {
+    svm.expireBlockhash();
+    const tx = new Transaction();
+    tx.recentBlockhash = svm.latestBlockhash();
+    tx.feePayer = payer.publicKey;
+    ixs.forEach((i) => tx.add(i));
+    tx.sign(payer, ...signers);
+    return svm.sendTransaction(tx);
+  }
+
+  /** Create a hooked mint, then try to give it `schedule`. */
+  function tryLaunch(schedule: Parameters<typeof initializeScheduleIx>[2]) {
+    const mint = Keypair.generate();
+    const mintLen = getMintLen([ExtensionType.TransferHook]);
+    const made = send([
+      SystemProgram.createAccount({
+        fromPubkey: payer.publicKey, newAccountPubkey: mint.publicKey, space: mintLen,
+        lamports: Number(svm.minimumBalanceForRentExemption(BigInt(mintLen))),
+        programId: TOKEN_2022_PROGRAM_ID,
+      }),
+      createInitializeTransferHookInstruction(mint.publicKey, PublicKey.default, PROGRAM_ID, TOKEN_2022_PROGRAM_ID),
+      createInitializeMintInstruction(mint.publicKey, DECIMALS, payer.publicKey, null, TOKEN_2022_PROGRAM_ID),
+    ], [mint]);
+    expect(made instanceof FailedTransactionMetadata, "mint creation should succeed").to.be.false;
+    return send([initializeScheduleIx(mint.publicKey, payer.publicKey, schedule)], []);
+  }
+
+  before(() => {
+    svm = new LiteSVM().withBuiltins().withSplPrograms().withSysvars();
+    svm.addProgramFromFile(PROGRAM_ID, SO_PATH);
+    payer = Keypair.generate();
+    svm.airdrop(payer.publicKey, 100_000_000_000n);
+    const c = svm.getClock();
+    c.unixTimestamp = T.openRegular.ts;
+    svm.setClock(c);
+  });
+
+  it("accepts the NYSE preset", () => {
+    const r = tryLaunch(NYSE);
+    expect(
+      r instanceof FailedTransactionMetadata,
+      `NYSE should be accepted, got ${r instanceof FailedTransactionMetadata ? r.err().toString() : ""}`
+    ).to.be.false;
+  });
+
+  it("rejects hours a user invented", () => {
+    const custom = { ...NYSE, windows: [{ daysMask: 0b1111111, openMinute: 0, closeMinute: 1440 }] };
+    const r = tryLaunch(custom);
+    expect(r instanceof FailedTransactionMetadata, "24/7 hours must be rejected").to.be.true;
+    expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_UNAPPROVED));
+  });
+
+  it("rejects a one-minute tweak to an approved market", () => {
+    const nudged = {
+      ...NYSE,
+      windows: [{ ...NYSE.windows[0], closeMinute: NYSE.windows[0].closeMinute + 1 }],
+    };
+    const r = tryLaunch(nudged);
+    expect(r instanceof FailedTransactionMetadata, "a nudged close must be rejected").to.be.true;
+    expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_UNAPPROVED));
+  });
+
+  it("rejects NYSE with a holiday quietly removed", () => {
+    const fewer = { ...NYSE, holidays: NYSE.holidays.slice(0, -1) };
+    const r = tryLaunch(fewer);
+    expect(r instanceof FailedTransactionMetadata, "a trimmed holiday list must be rejected").to.be.true;
+    expect((r as FailedTransactionMetadata).err().toString()).to.contain(String(ERR_UNAPPROVED));
+  });
+});
