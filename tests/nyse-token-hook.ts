@@ -49,6 +49,10 @@ import {
   type TokenMetadata,
 } from "@solana/spl-token-metadata";
 import { createHash } from "crypto";
+import { market } from "../scripts/markets/presets";
+import {
+  initializeScheduleIx, transferHookAccounts, extraAccountMetasAddress, scheduleAddress,
+} from "../scripts/markets/hook";
 import { expect } from "chai";
 import * as fs from "fs";
 
@@ -57,13 +61,14 @@ const SO_PATH = "target/deploy/nyse_token_hook.so";
 const DECIMALS = 9;
 
 /** Anchor error codes, in declaration order from NyseError. */
+/** HookError, in declaration order. The evaluator has one "closed" code now:
+ *  weekends, pre-market and after-hours are all MarketClosed. */
 const ERR = {
-  WEEKEND: 6000,
+  CLOSED: 6000,
   HOLIDAY: 6001,
-  PRE_MARKET: 6002,
-  AFTER_HOURS: 6003,
-  NOT_TRANSFERRING: 6004,
+  NOT_TRANSFERRING: 6002,
 };
+const NYSE = market("nyse");
 
 /** Exact UTC epochs for the stated Eastern wall-clock times. */
 const T = {
@@ -148,8 +153,7 @@ describe("NYSE transfer hook", () => {
       [],
       TOKEN_2022_PROGRAM_ID
     );
-    ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
-    ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+    ix.keys.push(...transferHookAccounts(mint.publicKey));
     return ix;
   }
 
@@ -248,16 +252,7 @@ describe("NYSE transfer hook", () => {
     // 2. Initialize the hook's extra-account-meta list.
     const initMetas = send(
       [
-        new TransactionInstruction({
-          programId: PROGRAM_ID,
-          keys: [
-            { pubkey: payer.publicKey, isSigner: true, isWritable: true },
-            { pubkey: extraMetas, isSigner: false, isWritable: true },
-            { pubkey: mint.publicKey, isSigner: false, isWritable: false },
-            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-          ],
-          data: anchorDiscriminator("initialize_extra_account_meta_list"),
-        }),
+        new TransactionInstruction(initializeScheduleIx(mint.publicKey, payer.publicKey, NYSE)),
       ],
       [payer]
     );
@@ -339,7 +334,7 @@ describe("NYSE transfer hook", () => {
 
   describe("transfers outside the session", () => {
     it("blocks weekends", () => {
-      expectTransferBlocked(T.weekend, ERR.WEEKEND);
+      expectTransferBlocked(T.weekend, ERR.CLOSED);
     });
 
     it("blocks exchange holidays", () => {
@@ -347,11 +342,11 @@ describe("NYSE transfer hook", () => {
     });
 
     it("blocks pre-market (09:00 ET)", () => {
-      expectTransferBlocked(T.preMarket, ERR.PRE_MARKET);
+      expectTransferBlocked(T.preMarket, ERR.CLOSED);
     });
 
     it("blocks after hours (16:30 ET)", () => {
-      expectTransferBlocked(T.afterHours, ERR.AFTER_HOURS);
+      expectTransferBlocked(T.afterHours, ERR.CLOSED);
     });
   });
 
@@ -466,8 +461,7 @@ describe("NYSE transfer hook", () => {
       const ix = createTransferCheckedInstruction(
         source, mint.publicKey, destination, delegate.publicKey, amount, DECIMALS, [], TOKEN_2022_PROGRAM_ID
       );
-      ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
-      ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+      ix.keys.push(...transferHookAccounts(mint.publicKey));
       svm.expireBlockhash();
       const tx = new Transaction();
       tx.recentBlockhash = svm.latestBlockhash();
@@ -493,7 +487,7 @@ describe("NYSE transfer hook", () => {
     it("blocks a delegate outside market hours", () => {
       setClock(T.weekend.ts);
       const before = rawBalance(destination);
-      expectCustomError(delegatedTransfer(1_000n) as FailedTransactionMetadata, ERR.WEEKEND, "delegated weekend transfer");
+      expectCustomError(delegatedTransfer(1_000n) as FailedTransactionMetadata, ERR.CLOSED, "delegated weekend transfer");
       expect(rawBalance(destination)).to.equal(before);
     });
   });
@@ -502,10 +496,10 @@ describe("NYSE transfer hook", () => {
   // close, to the second.
   describe("session boundaries, to the second", () => {
     const cases: [string, bigint, number | null][] = [
-      ["09:29:59 ET", 1_790_602_199n, ERR.PRE_MARKET],
+      ["09:29:59 ET", 1_790_602_199n, ERR.CLOSED],
       ["09:30:00 ET", 1_790_602_200n, null],
       ["15:59:59 ET", 1_790_625_599n, null],
-      ["16:00:00 ET", 1_790_625_600n, ERR.AFTER_HOURS],
+      ["16:00:00 ET", 1_790_625_600n, ERR.CLOSED],
     ];
 
     for (const [label, ts, code] of cases) {
@@ -535,9 +529,8 @@ describe("NYSE transfer hook", () => {
       const ix = createTransferCheckedInstruction(
         source, mint.publicKey, destination, payer.publicKey, 0n, DECIMALS, [], TOKEN_2022_PROGRAM_ID
       );
-      ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
-      ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
-      expectCustomError(send([ix], [payer]) as FailedTransactionMetadata, ERR.WEEKEND, "zero-amount weekend transfer");
+      ix.keys.push(...transferHookAccounts(mint.publicKey));
+      expectCustomError(send([ix], [payer]) as FailedTransactionMetadata, ERR.CLOSED, "zero-amount weekend transfer");
     });
 
     // Token-2022 short-circuits a transfer whose source and destination are the
@@ -551,8 +544,7 @@ describe("NYSE transfer hook", () => {
       const ix = createTransferCheckedInstruction(
         source, mint.publicKey, source, payer.publicKey, 1_000n, DECIMALS, [], TOKEN_2022_PROGRAM_ID
       );
-      ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
-      ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+      ix.keys.push(...transferHookAccounts(mint.publicKey));
       const r = send([ix], [payer]);
 
       expect(r instanceof FailedTransactionMetadata, "Token-2022 accepts it without calling the hook").to.be.false;
@@ -586,12 +578,15 @@ describe("NYSE transfer hook", () => {
         [
           new TransactionInstruction({
             programId: PROGRAM_ID,
+            // Execute takes the five interface accounts, then the extras the
+            // validation state resolves -- here, the schedule.
             keys: [
               { pubkey: source, isSigner: false, isWritable: false },
               { pubkey: mint.publicKey, isSigner: false, isWritable: false },
               { pubkey: destination, isSigner: false, isWritable: false },
               { pubkey: payer.publicKey, isSigner: false, isWritable: false },
               { pubkey: extraMetas, isSigner: false, isWritable: false },
+              { pubkey: scheduleAddress(mint.publicKey), isSigner: false, isWritable: false },
             ],
             data,
           }),
@@ -664,8 +659,7 @@ describe("launch configuration: fixed supply, immutable hook and metadata", () =
       [],
       TOKEN_2022_PROGRAM_ID
     );
-    ix.keys.push({ pubkey: PROGRAM_ID, isSigner: false, isWritable: false });
-    ix.keys.push({ pubkey: extraMetas, isSigner: false, isWritable: false });
+    ix.keys.push(...transferHookAccounts(mint.publicKey));
     return ix;
   }
 
@@ -755,16 +749,7 @@ describe("launch configuration: fixed supply, immutable hook and metadata", () =
 
     const initMetas = send(
       [
-        new TransactionInstruction({
-          programId: PROGRAM_ID,
-          keys: [
-            { pubkey: payer.publicKey, isSigner: true, isWritable: true },
-            { pubkey: extraMetas, isSigner: false, isWritable: true },
-            { pubkey: mint.publicKey, isSigner: false, isWritable: false },
-            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-          ],
-          data: anchorDiscriminator("initialize_extra_account_meta_list"),
-        }),
+        new TransactionInstruction(initializeScheduleIx(mint.publicKey, payer.publicKey, NYSE)),
       ],
       [payer]
     );

@@ -26,6 +26,8 @@ import {
   createAssociatedTokenAccountInstruction, createMintToInstruction, getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import { createHash } from "crypto";
+import { market } from "../scripts/markets/presets";
+import { initializeScheduleIx, transferHookAccounts } from "../scripts/markets/hook";
 import { expect } from "chai";
 import * as fs from "fs";
 
@@ -43,7 +45,9 @@ const LP_WEEKEND = 1_791_644_400n; // 2026-10-10 Sat 11:00 ET
 const LP_REOPEN = 1_791_817_200n; // 2026-10-12 Mon 11:00 ET
 
 /** Our NyseError codes, and Orca's badge rejection. */
-const ERR = { WEEKEND: 6000, AFTER_HOURS: 6003, UNSUPPORTED_TOKEN_MINT: 6047 };
+/** HookError now has a single closed code; 6047 is Orca's UnsupportedTokenMint. */
+const ERR = { CLOSED: 6000, UNSUPPORTED_TOKEN_MINT: 6047 };
+const NYSE = market("nyse");
 
 const TICK_SPACING = 64;
 const TICKS_PER_ARRAY = 88 * TICK_SPACING;
@@ -181,11 +185,9 @@ const haveFixtures = fs.existsSync(ORCA_SO) && fs.existsSync(ORCA_CFG) && fs.exi
     const [extraMetas] = PublicKey.findProgramAddressSync(
       [Buffer.from("extra-account-metas"), hookedMint.publicKey.toBuffer()], HOOK
     );
-    // Our hook resolves zero extra accounts, so Token-2022 wants exactly these.
-    hookAccounts = [
-      { pubkey: HOOK, isSigner: false, isWritable: false },
-      { pubkey: extraMetas, isSigner: false, isWritable: false },
-    ];
+    // Resolved extras first (the schedule), then the hook program, then the
+    // validation state -- the order addExtraAccountMetasForExecute produces.
+    hookAccounts = transferHookAccounts(hookedMint.publicKey);
 
     const mintLen = getMintLen([ExtensionType.TransferHook]);
     ok([
@@ -198,16 +200,7 @@ const haveFixtures = fs.existsSync(ORCA_SO) && fs.existsSync(ORCA_CFG) && fs.exi
       createInitializeMintInstruction(hookedMint.publicKey, 9, payer.publicKey, null, TOKEN_2022_PROGRAM_ID),
     ], [hookedMint], "create hooked mint");
 
-    ok([{
-      programId: HOOK,
-      keys: [
-        { pubkey: payer.publicKey, isSigner: true, isWritable: true },
-        { pubkey: extraMetas, isSigner: false, isWritable: true },
-        { pubkey: hookedMint.publicKey, isSigner: false, isWritable: false },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ],
-      data: createHash("sha256").update("global:initialize_extra_account_meta_list").digest().subarray(0, 8),
-    } as TransactionInstruction], [], "hook validation state");
+    ok([initializeScheduleIx(hookedMint.publicKey, payer.publicKey, NYSE)], [], "schedule + hook state");
 
     const qLen = getMintLen([]);
     ok([
@@ -323,17 +316,17 @@ const haveFixtures = fs.existsSync(ORCA_SO) && fs.existsSync(ORCA_CFG) && fs.exi
       console.log(`        [CU] Whirlpool swap incl. hook: ${(r as any).computeUnitsConsumed()}`);
     });
 
-    it("blocks a swap after the close with MarketClosedAfterHours", () => {
+    it("blocks a swap after the close", () => {
       setClock(AFTER_HOURS);
       const before = tokenBalance(ataB);
-      expectCustomError(send(swapIxs(), []), ERR.AFTER_HOURS, "swapV2 after hours");
+      expectCustomError(send(swapIxs(), []), ERR.CLOSED, "swapV2 after hours");
       expect(tokenBalance(ataB), "no tokens moved").to.equal(before);
     });
 
-    it("blocks a swap on a Saturday with MarketClosedWeekend", () => {
+    it("blocks a swap on a Saturday", () => {
       setClock(WEEKEND);
       const before = tokenBalance(ataB);
-      expectCustomError(send(swapIxs(), []), ERR.WEEKEND, "swapV2 on Saturday");
+      expectCustomError(send(swapIxs(), []), ERR.CLOSED, "swapV2 on Saturday");
       expect(tokenBalance(ataB), "no tokens moved").to.equal(before);
     });
 
@@ -379,13 +372,13 @@ const haveFixtures = fs.existsSync(ORCA_SO) && fs.existsSync(ORCA_CFG) && fs.exi
     it("blocks an LP from withdrawing outside market hours", () => {
       setClock(LP_WEEKEND);
       const before = tokenBalance(ataA);
-      expectCustomError(send(decreaseIxs(1_000_000), []), ERR.WEEKEND, "decreaseLiquidityV2 on Saturday");
+      expectCustomError(send(decreaseIxs(1_000_000), []), ERR.CLOSED, "decreaseLiquidityV2 on Saturday");
       expect(tokenBalance(ataA), "no tokens withdrawn").to.equal(before);
     });
 
     it("blocks an LP from collecting fees outside market hours", () => {
       setClock(LP_WEEKEND);
-      expectCustomError(send(collectFeesIxs(), []), ERR.WEEKEND, "collectFeesV2 on Saturday");
+      expectCustomError(send(collectFeesIxs(), []), ERR.CLOSED, "collectFeesV2 on Saturday");
     });
 
     it("allows an LP to withdraw once the market reopens", () => {

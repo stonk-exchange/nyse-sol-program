@@ -60,9 +60,10 @@ import {
   createUpdateAuthorityInstruction,
   type TokenMetadata,
 } from "@solana/spl-token-metadata";
-import { createHash } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
+import { market, MARKETS } from "./markets/presets";
+import { initializeScheduleIx, extraAccountMetasAddress, scheduleAddress } from "./markets/hook";
 
 const HOOK_PROGRAM_ID = new PublicKey("CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k");
 
@@ -96,10 +97,6 @@ function grindMint(maxAttempts = 10_000): Keypair {
   return Keypair.generate();
 }
 
-function anchorDiscriminator(name: string): Buffer {
-  return createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
-}
-
 async function main() {
   const cluster = arg("cluster", "devnet") as "devnet" | "testnet" | "mainnet-beta";
   const decimals = Number(arg("decimals", "9"));
@@ -107,6 +104,8 @@ async function main() {
   const name = arg("name");
   const symbol = arg("symbol");
   const uri = arg("uri");
+  const marketId = arg("market", "nyse");
+  const chosen = market(marketId);
   const execute = process.argv.includes("--execute");
 
   const supply = supplyWhole * 10n ** BigInt(decimals);
@@ -127,7 +126,8 @@ async function main() {
   const mint = grindMint();
   const connection = new Connection(clusterApiUrl(cluster), "confirmed");
 
-  const [extraMetas, metasBump] = PublicKey.findProgramAddressSync(
+  const extraMetas = extraAccountMetasAddress(mint.publicKey);
+  const [, metasBump] = PublicKey.findProgramAddressSync(
     [Buffer.from("extra-account-metas"), mint.publicKey.toBuffer()],
     HOOK_PROGRAM_ID
   );
@@ -160,12 +160,14 @@ async function main() {
   console.log(`  name / symbol  ${name} / ${symbol}`);
   console.log(`  uri            ${uri}`);
   console.log(`  hook program   ${HOOK_PROGRAM_ID.toBase58()}`);
+  console.log(`  market         ${chosen.label}`);
+  console.log(`  schedule PDA   ${scheduleAddress(mint.publicKey).toBase58()}`);
   console.log(`  validation PDA ${extraMetas.toBase58()} (bump ${metasBump}${metasBump === 255 ? "" : ", costs ~" + (255 - metasBump) * 1500 + " extra CU per transfer"})`);
   console.log(`  supply goes to ${treasuryOwner.toBase58()}`);
   console.log(`  treasury ATA   ${treasury.toBase58()}`);
   console.log(`  supply         ${supplyWhole} (${supply} base units, ${decimals} decimals)`);
   console.log(`  account size   ${mintLen} + ${metadataLen} metadata`);
-  console.log("  hook authority none from creation (enforced by the program)");
+  console.log("  hook authority none from creation, so the hook can never be repointed");
   console.log("  after launch   mint / freeze / metadata authorities also revoked");
 
   if (!execute) {
@@ -228,19 +230,13 @@ async function main() {
     await sendAndConfirmTransaction(connection, createMintTx, [wallet, mint])
   );
 
-  // 2. Initialize the hook's validation state. Transfers fail without this.
-  const initTx = new Transaction().add({
-    programId: HOOK_PROGRAM_ID,
-    keys: [
-      { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
-      { pubkey: extraMetas, isSigner: false, isWritable: true },
-      { pubkey: mint.publicKey, isSigner: false, isWritable: false },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    ],
-    data: anchorDiscriminator("initialize_extra_account_meta_list"),
-  });
+  // 2. Write the schedule and the hook's validation state. Transfers fail
+  //    without this, and the schedule can never be changed afterwards.
+  const initTx = new Transaction().add(
+    initializeScheduleIx(mint.publicKey, wallet.publicKey, chosen)
+  );
   console.log(
-    "2/3 initializing hook state:",
+    "2/3 writing schedule:",
     await sendAndConfirmTransaction(connection, initTx, [wallet])
   );
 

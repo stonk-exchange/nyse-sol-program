@@ -28,8 +28,9 @@ import {
   Connection, Keypair, PublicKey, SystemProgram, Transaction,
   TransactionInstruction, clusterApiUrl, sendAndConfirmTransaction,
 } from "@solana/web3.js";
-import { createHash } from "crypto";
 import { NATIVE_MINT } from "@solana/spl-token";
+import { market, MARKETS } from "./markets/presets";
+import { initializeScheduleIx, extraAccountMetasAddress } from "./markets/hook";
 import {
   DynamicBondingCurveClient,
   deriveDbcPoolAddress,
@@ -86,29 +87,6 @@ const CURVE = {
   migrationFeePercentage: 0,
   migratedPoolFeeBps: 0,
 };
-
-/**
- * DBC creates the mint and points it at our hook, but it has no way to know
- * our program also needs its validation state initialised. Without this
- * account Token-2022 cannot resolve the hook's extra accounts and every swap
- * fails with MissingRemainingAccountForTransferHook (DBC error 6071).
- */
-function initHookStateIx(mint: PublicKey, payer: PublicKey): TransactionInstruction {
-  const [extraMetas] = PublicKey.findProgramAddressSync(
-    [Buffer.from("extra-account-metas"), mint.toBuffer()],
-    HOOK_PROGRAM_ID
-  );
-  return new TransactionInstruction({
-    programId: HOOK_PROGRAM_ID,
-    keys: [
-      { pubkey: payer, isSigner: true, isWritable: true },
-      { pubkey: extraMetas, isSigner: false, isWritable: true },
-      { pubkey: mint, isSigner: false, isWritable: false },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    ],
-    data: createHash("sha256").update("global:initialize_extra_account_meta_list").digest().subarray(0, 8),
-  });
-}
 
 function arg(name: string, fallback?: string): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -185,7 +163,9 @@ function configParameters(feeClaimer: PublicKey) {
 async function main() {
   const cmd = process.argv[2];
   if (cmd !== "config" && cmd !== "token") {
-    throw new Error("usage: launch-dbc.ts <config|token> [...]");
+    throw new Error(
+      `usage: launch-dbc.ts <config|token> [...]\n  --market <${Object.keys(MARKETS).join("|")}>`
+    );
   }
   const cluster = arg("cluster", "devnet") as "devnet" | "mainnet-beta";
   const execute = process.argv.includes("--execute");
@@ -245,6 +225,10 @@ async function main() {
   const name = arg("name");
   const symbol = arg("symbol");
   const uri = arg("uri");
+  // Which market this token trades on. A market is data, so new ones need no
+  // program upgrade; the choice is fixed for the life of the token.
+  const marketId = arg("market", "nyse");
+  const chosen = market(marketId);
   const baseMint = Keypair.generate();
   const pool = deriveDbcPoolAddress(NATIVE_MINT, baseMint.publicKey, config);
 
@@ -255,7 +239,8 @@ async function main() {
   console.log(`  pool           ${pool.toBase58()}`);
   console.log(`  name / symbol  ${name} / ${symbol}`);
   console.log(`  uri            ${uri}`);
-  console.log(`  transfer hook  ${HOOK_PROGRAM_ID.toBase58()} (NYSE hours)`);
+  console.log(`  market         ${chosen.label}`);
+  console.log(`  transfer hook  ${HOOK_PROGRAM_ID.toBase58()}`);
 
   if (!execute) { console.log("\nDry run. Add --execute to send."); return; }
 
@@ -273,15 +258,12 @@ async function main() {
   // Must happen before anyone can trade.
   const initSig = await sendAndConfirmTransaction(
     connection,
-    new Transaction().add(initHookStateIx(baseMint.publicKey, wallet.publicKey)),
+    new Transaction().add(initializeScheduleIx(baseMint.publicKey, wallet.publicKey, chosen)),
     [wallet]
   );
-  console.log("hook state initialised:", initSig);
+  console.log("schedule + hook state written:", initSig);
 
-  const [extraMetas] = PublicKey.findProgramAddressSync(
-    [Buffer.from("extra-account-metas"), baseMint.publicKey.toBuffer()],
-    HOOK_PROGRAM_ID
-  );
+  const extraMetas = extraAccountMetasAddress(baseMint.publicKey);
   const check = await connection.getAccountInfo(extraMetas);
   if (!check) throw new Error("hook validation state missing -- the token is NOT tradeable");
   console.log("verified tradeable: validation state exists at", extraMetas.toBase58());
