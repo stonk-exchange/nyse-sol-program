@@ -16,7 +16,10 @@ import {
 } from "@solana/spl-token";
 import { createHash } from "crypto";
 import * as fs from "fs";
+import { market } from "./markets/presets";
+import { initializeScheduleIx, transferHookAccounts } from "./markets/hook";
 
+const NYSE = market("nyse");
 const HOOK = new PublicKey("CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k");
 const OPEN = 1_790_607_600n;
 const TICK_SPACING = 64;
@@ -72,9 +75,7 @@ function buildPool(hooked: boolean, sharedQuote?: Keypair) {
   do { base = Keypair.generate(); } while (Buffer.compare(base.publicKey.toBuffer(), quote.publicKey.toBuffer()) >= 0);
 
   const [extraMetas] = PublicKey.findProgramAddressSync([Buffer.from("extra-account-metas"), base.publicKey.toBuffer()], HOOK);
-  const hookAccounts: AccountMeta[] = hooked
-    ? [{ pubkey: HOOK, isSigner: false, isWritable: false }, { pubkey: extraMetas, isSigner: false, isWritable: false }]
-    : [];
+  const hookAccounts: AccountMeta[] = hooked ? transferHookAccounts(base.publicKey) : [];
 
   const mintLen = getMintLen(hooked ? [ExtensionType.TransferHook] : []);
   const ixs: TransactionInstruction[] = [
@@ -86,13 +87,7 @@ function buildPool(hooked: boolean, sharedQuote?: Keypair) {
   send(ixs, [base], "base mint");
 
   if (hooked) {
-    send([{ programId: HOOK, keys: [
-      { pubkey: payer.publicKey, isSigner: true, isWritable: true },
-      { pubkey: extraMetas, isSigner: false, isWritable: true },
-      { pubkey: base.publicKey, isSigner: false, isWritable: false },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }],
-      data: createHash("sha256").update("global:initialize_extra_account_meta_list").digest().subarray(0, 8),
-    } as TransactionInstruction], [], "hook state");
+    send([initializeScheduleIx(base.publicKey, payer.publicKey, NYSE)], [], "schedule + hook state");
   }
 
   if (!sharedQuote) {
