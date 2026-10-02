@@ -54,20 +54,37 @@ import * as os from "os";
 
 const HOOK_PROGRAM_ID = new PublicKey("CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k");
 
-/** Lifted verbatim from the live hooked-token config so ours behaves identically. */
+/**
+ * Curve parameters.
+ *
+ * The sqrtStartPrice and curve points are taken verbatim from a live
+ * 100,000 SOL config on mainnet, because they have to be mathematically
+ * consistent with the migration threshold -- DBC rejects a config where they
+ * are not. Only the fee and the recipients are ours.
+ *
+ * The threshold is the whole point. DBC revokes a mint's transfer hook when the
+ * curve completes, which would end the trading-hours restriction permanently.
+ * That is not configurable. Setting the threshold at 100,000 SOL puts
+ * completion out of economic reach, so the hook is never revoked and the hours
+ * hold for the life of the token. It is an economic guarantee, not a structural
+ * one: enough buying would still graduate the pool and strip the hook.
+ */
 const CURVE = {
   // 1% trading fee: 10_000_000 / FEE_DENOMINATOR (1e9).
+  // Meteora keeps 20% of it as protocol fee, so the claimer nets ~0.8%.
   cliffFeeNumerator: new BN(10_000_000),
-  sqrtStartPrice: new BN("120417309712829408"),
-  migrationQuoteThreshold: new BN("127426820765"), // ~127.43 SOL to graduate
+  sqrtStartPrice: new BN("101036978416954620"),
+  migrationQuoteThreshold: new BN("100000000000000"), // 100,000 SOL
   points: [
-    { sqrtPrice: new BN("447330446354483717"), liquidity: new BN("132637986422230078220027579937847") },
-    { sqrtPrice: new BN("79226673521066979257578248091"), liquidity: new BN("3453807957852117599532203") },
+    {
+      sqrtPrice: new BN("449154274387104154620"),
+      liquidity: new BN("75777733812715966441353696383589"),
+    },
   ],
   tokenSupply: new BN("1000000000000000"), // 1e15 base units = 1B at 6 decimals
   tokenDecimal: 6,
-  migrationFeePercentage: 10,
-  migratedPoolFeeBps: 120,
+  migrationFeePercentage: 0,
+  migratedPoolFeeBps: 0,
 };
 
 /**
@@ -124,9 +141,9 @@ function configParameters(feeClaimer: PublicKey) {
     tokenType: 1, // Token-2022, required for a transfer hook
     tokenDecimal: CURVE.tokenDecimal,
     partnerLiquidityPercentage: 0,
-    partnerPermanentLockedLiquidityPercentage: 100,
+    partnerPermanentLockedLiquidityPercentage: 50,
     creatorLiquidityPercentage: 0,
-    creatorPermanentLockedLiquidityPercentage: 0,
+    creatorPermanentLockedLiquidityPercentage: 50,
     migrationQuoteThreshold: CURVE.migrationQuoteThreshold,
     sqrtStartPrice: CURVE.sqrtStartPrice,
     lockedVesting: {
@@ -136,21 +153,21 @@ function configParameters(feeClaimer: PublicKey) {
       numberOfPeriod: new BN(0),
       cliffUnlockAmount: new BN(0),
     },
-    migrationFeeOption: 6,
+    migrationFeeOption: 2, // FixedBps100
     tokenSupply: {
       preMigrationTokenSupply: CURVE.tokenSupply,
       postMigrationTokenSupply: CURVE.tokenSupply,
     },
     // 0% to the token creator: the whole trading fee goes to the partner.
     creatorTradingFeePercentage: 0,
-    tokenUpdateAuthority: 2,
+    tokenUpdateAuthority: 1, // Immutable: name, symbol and uri can never change
     migrationFee: {
       feePercentage: CURVE.migrationFeePercentage,
       creatorFeePercentage: 0,
     },
     migratedPoolFee: {
       collectFeeMode: 0,
-      dynamicFee: 1,
+      dynamicFee: 0,
       poolFeeBps: CURVE.migratedPoolFeeBps,
     },
     poolCreationFee: new BN(0),
@@ -192,8 +209,9 @@ async function main() {
     console.log(`  transfer hook  ${HOOK_PROGRAM_ID.toBase58()}`);
     console.log(`  trading fee    1% of every buy and sell`);
     console.log(`  creator share  0% (all of it goes to the fee claimer)`);
-    console.log(`  migration fee  ${CURVE.migrationFeePercentage}% at graduation`);
-    console.log(`  graduates at   ${Number(CURVE.migrationQuoteThreshold) / 1e9} SOL`);
+    console.log(`  graduates at   ${(Number(CURVE.migrationQuoteThreshold) / 1e9).toLocaleString()} SOL  <-- deliberately out of reach`);
+    console.log(`                 DBC revokes the hook when a curve completes, so a`);
+    console.log(`                 reachable threshold would end the trading hours.`);
     console.log(`  supply         1,000,000,000 at ${CURVE.tokenDecimal} decimals`);
 
     if (!execute) { console.log("\nDry run. Add --execute to send."); return; }

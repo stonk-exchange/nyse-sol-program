@@ -312,11 +312,26 @@ it at this program, but it cannot know this program also needs its
 does this immediately after pool creation and verifies the account exists before
 reporting success.
 
-**The restriction ends at graduation.** DBC holds the mint's transfer-hook
-authority so it can revoke the hook when the curve completes, which it must
-because DAMM v2 cannot forward hook accounts. The trading-hours rule therefore
-applies for the bonding-curve phase only. This is inherent to DBC and is the
-same deal every other hooked token on it has.
+### Why the migration threshold is 100,000 SOL
+
+DBC holds the mint's transfer-hook authority so it can revoke the hook when the
+curve completes, which it must, because DAMM v2 cannot forward hook accounts.
+That revocation is not configurable and it ends the trading-hours restriction
+permanently.
+
+This is not theoretical. Of the 1,542 transfer-hook DBC pools on mainnet, 16
+have graduated, and **all 16 have their hook revoked, authority `none`** — with
+no exceptions.
+
+The only defence is never completing the curve, so the config sets the
+migration threshold at **100,000 SOL**, far out of economic reach. The curve
+parameters are taken verbatim from a live 100,000 SOL config, since DBC rejects
+a config whose curve and threshold are not mathematically consistent.
+
+Be honest about what this is: an **economic** guarantee, not a structural one.
+Roughly $20M of buying would still graduate the pool and strip the hook. It is
+the strongest guarantee available on DBC, and it is the same mechanism the other
+hours-style launchpad uses.
 
 ### Verified against the real program
 
@@ -325,11 +340,13 @@ validator, with the wrapped-SOL mint cloned in:
 
 | Step | Result |
 | --- | --- |
-| Create partner config | succeeded, 31k CU |
+| Create partner config (100,000 SOL threshold) | succeeded |
 | Create pool with our hook | succeeded |
-| Initialise hook validation state | succeeded |
-| Buy 0.1 SOL of the token | succeeded, hook invoked, 117k CU |
-| Partner fee credited | 0.0008 SOL on a 0.1 SOL buy |
+| Initialise hook validation state | succeeded, verified |
+| Buy and sell during market hours | succeeded, ~140k / ~115k CU |
+| Buy on a Saturday | rejected by our hook |
+| `claimPartnerTradingFee2` | 0.005997 SOL of 0.006002 paid out |
+| Claim while the market is closed | succeeded — fees are quote-side, unhooked |
 
 The launched mint matches the existing hooked tokens exactly: same extensions
 (`MetadataPointer`, `TransferHook`, `TokenMetadata`), 6 decimals, 1e15 supply,
