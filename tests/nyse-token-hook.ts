@@ -1036,7 +1036,7 @@ describe("only approved markets can be launched", () => {
 describe("market registry", () => {
   const ERR_UNAPPROVED = 6013;
   // Matches REGISTRY_BOOTSTRAP in lib.rs.
-  const BOOTSTRAP = new PublicKey("7osGZ9jc437CmJBvmvy5x5uK5URFLEdnURiVnCUhGZxR");
+  const BOOTSTRAP = new PublicKey("FTnprQrxXRGBAJRg8axCbocBNeSvQC3YoCFqEE8khJ3c");
 
   // A market the program has never heard of: London, EU daylight-saving rule.
   const LSE = {

@@ -261,7 +261,14 @@ this and will refuse to initialise otherwise. The test suite includes a mutation
 check showing why: if that authority survives, the hook can be repointed at a
 no-op program and the market-hours restriction disappears entirely.
 
-### 3. Burn the program upgrade authority
+### 3. Create the market registry
+
+Only `REGISTRY_BOOTSTRAP` — the launch Ledger, `FTnprQrxXRGBAJRg8axCbocBNeSvQC3YoCFqEE8khJ3c` —
+can do this, and only once. Do it before burning the upgrade authority: if the
+registry is never created, no market can ever be added and the program is
+limited to its compiled-in list forever.
+
+### 4. Burn the program upgrade authority
 
 The mint is locked, but the *program* can still be upgraded, which would let the
 holder of that key rewrite the trading-hours rule for every token using the hook.

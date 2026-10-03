@@ -53,9 +53,9 @@ const MAX_EVENTS: usize = 64;
 /// Bootstraps the market registry. Only this key can create the registry
 /// account, after which the authority it names takes over and can be rotated.
 ///
-/// MUST be set to the launch wallet before mainnet deploy: whoever holds it
-/// decides which markets exist.
-pub const REGISTRY_BOOTSTRAP: Pubkey = pubkey!("7osGZ9jc437CmJBvmvy5x5uK5URFLEdnURiVnCUhGZxR");
+/// This is the launch Ledger. Whoever holds it decides which markets may ever
+/// be launched, and it is frozen once the upgrade authority is burned.
+pub const REGISTRY_BOOTSTRAP: Pubkey = pubkey!("FTnprQrxXRGBAJRg8axCbocBNeSvQC3YoCFqEE8khJ3c");
 
 #[program]
 pub mod nyse_token_hook {
