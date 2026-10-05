@@ -70,10 +70,37 @@ const HOOK_PROGRAM_ID = new PublicKey("CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaP
  * hold for the life of the token. It is an economic guarantee, not a structural
  * one: enough buying would still graduate the pool and strip the hook.
  */
+/**
+ * Fee tiers the creator chooses from.
+ *
+ * Meteora takes 20% of every trading fee as protocol fee, and the remaining
+ * 80% is split between the partner (us) and the creator. Each tier is sized so
+ * the PLATFORM always nets ~1% of volume, whatever the creator takes:
+ *
+ *   total x (1 - creatorShare) x 0.8 = 1%
+ *
+ * so a bigger creator cut means a bigger total fee, not a smaller one for us.
+ * Each tier is a separate DBC config, created once and reused forever.
+ */
+export const FEE_TIERS = {
+  "0.5": { cliffFeeNumerator: 18_700_000, creatorSharePct: 33 },
+  "1":   { cliffFeeNumerator: 25_000_000, creatorSharePct: 50 },
+  "2":   { cliffFeeNumerator: 37_900_000, creatorSharePct: 67 },
+} as const;
+
+type TierId = keyof typeof FEE_TIERS;
+
+/** What each side actually receives, after Meteora's 20% protocol cut. */
+function tierSplit(t: { cliffFeeNumerator: number; creatorSharePct: number }) {
+  const total = t.cliffFeeNumerator / 1e7;
+  return {
+    total,
+    creator: total * (t.creatorSharePct / 100) * 0.8,
+    platform: total * ((100 - t.creatorSharePct) / 100) * 0.8,
+  };
+}
+
 const CURVE = {
-  // 1% trading fee: 10_000_000 / FEE_DENOMINATOR (1e9).
-  // Meteora keeps 20% of it as protocol fee, so the claimer nets ~0.8%.
-  cliffFeeNumerator: new BN(10_000_000),
   sqrtStartPrice: new BN("101036978416954620"),
   migrationQuoteThreshold: new BN("100000000000000"), // 100,000 SOL
   points: [
@@ -101,11 +128,12 @@ function loadWallet(): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(path, "utf8"))));
 }
 
-function configParameters(feeClaimer: PublicKey) {
+function configParameters(feeClaimer: PublicKey, tier: TierId) {
+  const t = FEE_TIERS[tier];
   return {
     poolFees: {
       baseFee: {
-        cliffFeeNumerator: CURVE.cliffFeeNumerator,
+        cliffFeeNumerator: new BN(t.cliffFeeNumerator),
         firstFactor: 0,
         secondFactor: new BN(0),
         thirdFactor: new BN(0),
@@ -136,8 +164,7 @@ function configParameters(feeClaimer: PublicKey) {
       preMigrationTokenSupply: CURVE.tokenSupply,
       postMigrationTokenSupply: CURVE.tokenSupply,
     },
-    // 0% to the token creator: the whole trading fee goes to the partner.
-    creatorTradingFeePercentage: 0,
+    creatorTradingFeePercentage: t.creatorSharePct,
     tokenUpdateAuthority: 1, // Immutable: name, symbol and uri can never change
     migrationFee: {
       feePercentage: CURVE.migrationFeePercentage,
@@ -162,9 +189,11 @@ function configParameters(feeClaimer: PublicKey) {
 
 async function main() {
   const cmd = process.argv[2];
-  if (cmd !== "config" && cmd !== "token") {
+  if (cmd !== "config" && cmd !== "token" && cmd !== "claim") {
     throw new Error(
-      `usage: launch-dbc.ts <config|token> [...]\n  --market <${Object.keys(MARKETS).join("|")}>`
+      `usage: launch-dbc.ts <config|token|claim> [...]\n` +
+        `  --market <${Object.keys(MARKETS).join("|")}>\n` +
+        `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)`
     );
   }
   const cluster = arg("cluster", "devnet") as "devnet" | "mainnet-beta";
@@ -178,6 +207,11 @@ async function main() {
 
   if (cmd === "config") {
     const feeClaimer = new PublicKey(arg("fee-claimer", wallet.publicKey.toBase58()));
+    const tier = arg("tier", "1") as TierId;
+    if (!(tier in FEE_TIERS)) {
+      throw new Error(`unknown --tier '${tier}'. choose ${Object.keys(FEE_TIERS).join(", ")}`);
+    }
+    const split = tierSplit(FEE_TIERS[tier]);
     const config = Keypair.generate();
 
     console.log("Create DBC partner config");
@@ -187,8 +221,11 @@ async function main() {
     console.log(`  fee claimer    ${feeClaimer.toBase58()}  <-- receives the trading fee`);
     console.log(`  quote mint     SOL`);
     console.log(`  transfer hook  ${HOOK_PROGRAM_ID.toBase58()}`);
-    console.log(`  trading fee    1% of every buy and sell`);
-    console.log(`  creator share  0% (all of it goes to the fee claimer)`);
+    console.log(`  fee tier       ${tier}% creator`);
+    console.log(`  trading fee    ${split.total.toFixed(2)}% of every buy and sell`);
+    console.log(`    creator gets ${split.creator.toFixed(3)}%`);
+    console.log(`    you get      ${split.platform.toFixed(3)}%`);
+    console.log(`    Meteora gets ${(split.total * 0.2).toFixed(3)}% (20% protocol fee)`);
     console.log(`  graduates at   ${(Number(CURVE.migrationQuoteThreshold) / 1e9).toLocaleString()} SOL  <-- deliberately out of reach`);
     console.log(`                 DBC revokes the hook when a curve completes, so a`);
     console.log(`                 reachable threshold would end the trading hours.`);
@@ -200,7 +237,7 @@ async function main() {
     if (!hook?.executable) throw new Error(`hook program is not deployed on ${cluster}`);
 
     const tx = await client.partner.createConfigWithTransferHook({
-      ...configParameters(feeClaimer),
+      ...configParameters(feeClaimer, tier),
       config: config.publicKey,
       feeClaimer,
       leftoverReceiver: feeClaimer,
@@ -211,12 +248,51 @@ async function main() {
     const sig = await sendAndConfirmTransaction(connection, tx, [wallet, config]);
     console.log("\nconfig created:", sig);
     console.log("config address:", config.publicKey.toBase58());
-    fs.writeFileSync(`dbc-config-${cluster}.json`, JSON.stringify({
-      cluster, config: config.publicKey.toBase58(), feeClaimer: feeClaimer.toBase58(),
-      transferHookProgram: HOOK_PROGRAM_ID.toBase58(), tradingFeeBps: 100,
+    fs.writeFileSync(`dbc-config-${cluster}-${tier}.json`, JSON.stringify({
+      cluster, tier, config: config.publicKey.toBase58(), feeClaimer: feeClaimer.toBase58(),
+      transferHookProgram: HOOK_PROGRAM_ID.toBase58(),
+      totalFeePct: split.total, creatorPct: split.creator, platformPct: split.platform,
       createdAt: new Date().toISOString(),
     }, null, 2) + "\n");
-    console.log(`wrote dbc-config-${cluster}.json -- reuse this config for every future token`);
+    console.log(`wrote dbc-config-${cluster}-${tier}.json -- reuse for every token on this tier`);
+    return;
+  }
+
+  if (cmd === "claim") {
+    // Trading fees accrue inside the pool and have to be pulled out. The
+    // partner's share and the creator's share are separate pots with separate
+    // claimers; --as picks which one this wallet is claiming.
+    const pool = new PublicKey(arg("pool"));
+    const as = arg("as", "partner");
+    const receiver = new PublicKey(arg("receiver", wallet.publicKey.toBase58()));
+
+    const state = await client.state.getPool(pool);
+    if (!state) throw new Error(`no DBC pool at ${pool.toBase58()}`);
+    const ps: any = (state as any).poolState ?? state;
+    const quote = as === "creator" ? ps.creatorQuoteFee : ps.partnerQuoteFee;
+    const base = as === "creator" ? ps.creatorBaseFee : ps.partnerBaseFee;
+
+    console.log(`claim ${as} fees`);
+    console.log(`  pool       ${pool.toBase58()}`);
+    console.log(`  claimer    ${wallet.publicKey.toBase58()}`);
+    console.log(`  receiver   ${receiver.toBase58()}`);
+    console.log(`  claimable  ${(Number(quote) / 1e9).toFixed(6)} SOL + ${base} base units`);
+
+    if (Number(quote) === 0 && Number(base) === 0) {
+      console.log("\nNothing to claim.");
+      return;
+    }
+    if (!execute) { console.log("\nDry run. Add --execute to send."); return; }
+
+    const params = {
+      payer: wallet.publicKey, pool, receiver,
+      maxBaseAmount: base, maxQuoteAmount: quote,
+    };
+    const tx =
+      as === "creator"
+        ? await client.creator.claimCreatorTradingFee2({ ...params, creator: wallet.publicKey })
+        : await client.partner.claimPartnerTradingFee2({ ...params, feeClaimer: wallet.publicKey });
+    console.log("\nclaimed:", await sendAndConfirmTransaction(connection, tx, [wallet]));
     return;
   }
 

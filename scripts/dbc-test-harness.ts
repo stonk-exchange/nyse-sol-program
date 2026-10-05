@@ -135,6 +135,28 @@ function arg(n: string, d?: string): string {
     console.log(`  SOL received:                      ${(Number(svm.getBalance(payer.publicKey)! - before) / 1e9).toFixed(6)}`);
   }
 
+  // The creator's share is a separate pot with a separate claimer. On a tier
+  // with a non-zero creator share this must also pay out.
+  const afterPartner = poolState();
+  const cQuote = BigInt(afterPartner.creatorQuoteFee.toString());
+  const cBase = BigInt(afterPartner.creatorBaseFee.toString());
+  console.log(`  creator fees accrued:              ${(Number(cQuote) / 1e9).toFixed(6)} SOL`);
+  if (cQuote > 0n || cBase > 0n) {
+    const beforeC = svm.getBalance(payer.publicKey)!;
+    tx = await client.creator.claimCreatorTradingFee2({
+      creator: payer.publicKey, payer: payer.publicKey, pool, receiver: payer.publicKey,
+      maxBaseAmount: new BN(cBase.toString()), maxQuoteAmount: new BN(cQuote.toString()),
+    } as any);
+    await clone(tx);
+    if (run(tx, [], "claimCreatorTradingFee2")) {
+      console.log(`  SOL received:                      ${(Number(svm.getBalance(payer.publicKey)! - beforeC) / 1e9).toFixed(6)}`);
+      const left = poolState();
+      console.log(`  creator fees left in pool:         ${(Number(left.creatorQuoteFee) / 1e9).toFixed(6)} SOL`);
+    }
+  } else {
+    console.log("  (this config has a 0% creator share, nothing to claim)");
+  }
+
   console.log("\nMARKET CLOSED (Sat 11:00 ET)");
   setClock(SATURDAY);
   tx = await swap(100_000_000n, false); await clone(tx);

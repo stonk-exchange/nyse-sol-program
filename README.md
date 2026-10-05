@@ -137,6 +137,16 @@ lower CU figure because it never reaches the calendar code.
 
 `scripts/probe-mainnet-hook.ts` is the single-mint version, with full logs.
 
+```bash
+npm run probe:kinds -- --mint <MINT>
+```
+
+Distinguishes a wallet-to-wallet send from a pool trade, by classifying each
+holder's owner as on-curve (a real wallet) or off-curve (a PDA, in practice a
+pool vault). Some hooks gate only trades and let plain sends through; comparing
+the two shapes, and the compute units each consumes, shows which. This hook
+gates both, so both shapes block outside market hours.
+
 ### Clock drift
 
 ```bash
@@ -297,10 +307,26 @@ Dynamic Bonding Curve with you as the partner collecting the trading fee. This
 is the same venue and the same curve configuration as the existing hooked
 tokens, so the result trades identically.
 
+### Fee tiers
+
+The creator picks how much of the trading fee they keep. Each tier is sized so
+**the platform always nets ~1% of volume**, so a bigger creator cut means a
+bigger total fee rather than a smaller share for you:
+
+| `--tier` | Total fee | Creator nets | You net | Meteora (20% protocol) |
+| --- | ---: | ---: | ---: | ---: |
+| `0.5` | 1.87% | 0.494% | 1.002% | 0.374% |
+| `1` | 2.50% | 1.000% | 1.000% | 0.500% |
+| `2` | 3.79% | 2.031% | 1.001% | 0.758% |
+
+Each tier is a separate DBC config, created once and reused for every token on
+it. Partner and creator fees are separate pots with separate claimers — see
+`claim` below.
+
 ```bash
-# once: create your partner config. You are the fee claimer.
+# once per tier: create a partner config. You are the fee claimer.
 ANCHOR_WALLET=./hot.json npx ts-node scripts/launch-dbc.ts config \
-  --cluster mainnet-beta --fee-claimer <YOUR_LEDGER_ADDRESS> --execute
+  --cluster mainnet-beta --fee-claimer <YOUR_LEDGER_ADDRESS> --tier 1 --execute
 
 # per token, reusing that config forever
 ANCHOR_WALLET=./hot.json npx ts-node scripts/launch-dbc.ts token \
@@ -308,7 +334,17 @@ ANCHOR_WALLET=./hot.json npx ts-node scripts/launch-dbc.ts token \
   --name "STONKS" --symbol STONKS --uri https://example.com/meta.json --execute
 ```
 
-Both commands dry-run without `--execute`. `--rpc` points them at any endpoint,
+Collect accrued fees with `claim`. Fees are collected in SOL, not the token,
+so the hook never touches them and they can be claimed at any hour:
+
+```bash
+ANCHOR_WALLET=./hot.json npx ts-node scripts/launch-dbc.ts claim \
+  --cluster mainnet-beta --pool <POOL> --as partner --execute
+```
+
+`--as creator` claims the creator's pot instead.
+
+All commands dry-run without `--execute`. `--rpc` points them at any endpoint,
 so the whole flow can be rehearsed against a local validator with the DBC
 program cloned in.
 
