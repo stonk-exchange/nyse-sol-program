@@ -90,3 +90,7 @@ pids
 
 # Orca test fixtures (fetched from mainnet, see scripts/fetch-orca-fixtures.sh)
 fixtures/
+
+# Python bytecode
+__pycache__/
+*.pyc
