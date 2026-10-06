@@ -275,7 +275,8 @@ async function assertClaimable(
   connection: Connection,
   addr: PublicKey,
   signer: Signer,
-  role: string
+  role: string,
+  flag: string
 ) {
   // Off-curve addresses are PDAs. A PDA has no secret key, so nothing can ever
   // produce its signature.
@@ -299,7 +300,7 @@ async function assertClaimable(
       throw new Error(
         `${role} is the hot wallet signing this (${addr.toBase58()}).\n` +
           `  This is permanent. If that key is a throwaway, the income is gone with it.\n` +
-          `  Pass --fee-claimer <your wallet>, or --allow-hot-fee-claimer if you mean it.`
+          `  Pass ${flag} <your wallet>, or --allow-hot-fee-claimer if you mean it.`
       );
     }
     console.log(`  NOTE: ${role} is the signing hot wallet, allowed explicitly.`);
@@ -371,7 +372,7 @@ async function main() {
     // signer is how platform fees end up permanently assigned to a throwaway
     // hot key.
     const feeClaimer = new PublicKey(arg("fee-claimer", PLATFORM_FEE_CLAIMER.toBase58()));
-    await assertClaimable(connection, feeClaimer, signer, "fee claimer");
+    await assertClaimable(connection, feeClaimer, signer, "fee claimer", "--fee-claimer");
     const tier = arg("tier", "1") as TierId;
     if (!(tier in FEE_TIERS)) {
       throw new Error(`unknown --tier '${tier}'. choose ${Object.keys(FEE_TIERS).join(", ")}`);
@@ -591,7 +592,7 @@ async function main() {
   // signer here is a throwaway hot wallet, so defaulting this to the signer
   // would quietly send that share to a key you intend to discard.
   const creator = new PublicKey(arg("creator", PLATFORM_FEE_CLAIMER.toBase58()));
-  await assertClaimable(connection, creator, signer, "pool creator");
+  await assertClaimable(connection, creator, signer, "pool creator", "--creator");
   const baseMint = Keypair.generate();
   // Read the quote mint off the config rather than assuming SOL: the pool
   // address is derived from it, and a wrong guess derives a different pool.
