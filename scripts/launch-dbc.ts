@@ -171,11 +171,16 @@ function buildCurveConfig(opts: {
       migrationFee: { feePercentage: 0, creatorFeePercentage: 0 },
       migratedPoolFee: { collectFeeMode: 0, dynamicFee: 0, poolFeeBps: 0 },
     },
+    // These four must sum to 100 and the names must be exactly these: the
+    // builder reads them off the object and silently emits `undefined` for any
+    // it does not recognise, which only surfaces later as "Sum of LP
+    // percentages must equal 100" from the config validator.
+    // All of it is permanently locked -- nobody can pull the migrated LP.
     liquidityDistribution: {
-      partnerLockedLpPercentage: 50,
-      partnerLpPercentage: 0,
-      creatorLockedLpPercentage: 50,
-      creatorLpPercentage: 0,
+      partnerPermanentLockedLiquidityPercentage: 50,
+      partnerLiquidityPercentage: 0,
+      creatorPermanentLockedLiquidityPercentage: 50,
+      creatorLiquidityPercentage: 0,
     },
     // No vesting. These are the builder's HIGH-LEVEL inputs, not the
     // already-computed on-chain shape: it derives amountPerPeriod itself and
@@ -359,6 +364,17 @@ async function main() {
       cliffFeeNumerator: FEE_TIERS[tier].cliffFeeNumerator,
       creatorSharePct: FEE_TIERS[tier].creatorSharePct,
     });
+    // The builder returns `undefined` rather than throwing when it does not
+    // recognise an input field, so check its output instead of trusting it.
+    const lp = [
+      "partnerPermanentLockedLiquidityPercentage", "partnerLiquidityPercentage",
+      "creatorPermanentLockedLiquidityPercentage", "creatorLiquidityPercentage",
+    ] as const;
+    const missing = lp.filter((k) => (curve as any)[k] === undefined);
+    if (missing.length) throw new Error(`curve builder did not set ${missing.join(", ")}`);
+    const lpSum = lp.reduce((n, k) => n + Number((curve as any)[k]), 0);
+    if (lpSum !== 100) throw new Error(`LP percentages sum to ${lpSum}, not 100`);
+
     const threshold = Number(curve.migrationQuoteThreshold) / 10 ** quote.decimals;
     if (threshold !== migrationThreshold) {
       throw new Error(`asked for a ${migrationThreshold} threshold, curve encodes ${threshold}`);
@@ -521,7 +537,23 @@ async function main() {
   console.log(`  config         ${config.toBase58()}`);
   const cfgQuoteLabel =
     Object.values(QUOTES).find((q) => q.mint === cfgQuote.toBase58())?.symbol ?? cfgQuote.toBase58();
+
+  // A Token-2022 quote mint needs its DBC token badge here as well as at
+  // config creation -- pool creation re-checks it and fails with
+  // InvalidTokenBadge (6080) otherwise.
+  const cfgQuoteInfo = await connection.getAccountInfo(cfgQuote);
+  if (!cfgQuoteInfo) throw new Error(`quote mint ${cfgQuote.toBase58()} not found`);
+  let tokenBadge: PublicKey | undefined;
+  if (cfgQuoteInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+    const badge = deriveTokenBadgeAddress(cfgQuote);
+    if (!(await connection.getAccountInfo(badge))) {
+      throw new Error(`${cfgQuoteLabel} has no DBC token badge (${badge.toBase58()})`);
+    }
+    tokenBadge = badge;
+  }
+
   console.log(`  quote mint     ${cfgQuoteLabel}`);
+  if (tokenBadge) console.log(`  quote badge    ${tokenBadge.toBase58()}`);
   console.log(`  base mint      ${baseMint.publicKey.toBase58()}`);
   console.log(`  pool           ${pool.toBase58()}`);
   console.log(`  name / symbol  ${name} / ${symbol}`);
@@ -535,6 +567,14 @@ async function main() {
     console.log(`                 or the creator fees are stranded there.`);
   }
 
+  if (!creator.equals(signer.publicKey)) {
+    throw new Error(
+      `--creator ${creator.toBase58()} must sign this transaction, but the signer is ` +
+        `${signer.publicKey.toBase58()}.\n` +
+        `  Run this with the creator's own key (--ledger, or ANCHOR_WALLET), or drop --creator.`
+    );
+  }
+
   if (!execute) { console.log("\nDry run. Add --execute to send."); return; }
 
   const tx = await client.creator.createPoolWithTransferHook({
@@ -544,6 +584,7 @@ async function main() {
     payer: wallet.publicKey,
     poolCreator: creator,
     transferHookProgram: HOOK_PROGRAM_ID,
+    ...(tokenBadge ? { tokenBadge } : {}),
   });
   const sig = await signer.send(connection, tx, [baseMint]);
   console.log("\npool created:", sig);

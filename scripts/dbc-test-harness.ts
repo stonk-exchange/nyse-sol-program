@@ -31,7 +31,7 @@
  */
 import { LiteSVM, FailedTransactionMetadata } from "litesvm";
 import { Connection, Keypair, PublicKey, Transaction, ComputeBudgetProgram } from "@solana/web3.js";
-import { DynamicBondingCurveClient, SwapMode } from "@meteora-ag/dynamic-bonding-curve-sdk";
+import { DynamicBondingCurveClient, SwapMode, deriveTokenBadgeAddress } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import * as t from "@solana/spl-token";
 import BN from "bn.js";
 import * as fs from "fs";
@@ -67,6 +67,12 @@ function arg(n: string, d?: string): string {
   svm.addProgramFromFile(DBC, "fixtures/dbc/dbc.so");
   if (fs.existsSync("fixtures/dbc/dammv2.so")) svm.addProgramFromFile(DAMM2, "fixtures/dbc/dammv2.so");
   svm.addProgramFromFile(HOOK, "target/deploy/nyse_token_hook.so");
+  // withSplPrograms() bundles a Token-2022 older than mainnet's, which cannot
+  // parse ScaledUiAmountConfig or PausableConfig -- both of which every xStock
+  // quote mint carries. Override it with the real one.
+  if (fs.existsSync("fixtures/dbc/token2022.so")) {
+    svm.addProgramFromFile(t.TOKEN_2022_PROGRAM_ID, "fixtures/dbc/token2022.so");
+  }
   svm.airdrop(payer.publicKey, 100_000n * 1_000_000_000n);
 
   const seen = new Set<string>();
@@ -94,6 +100,13 @@ function arg(n: string, d?: string): string {
       const logs = (r as any).meta?.().logs?.() ?? [];
       const m = logs.find((l: string) => l.includes("Error Message:"));
       console.log(`  ${label.padEnd(34)} FAILED  ${(m ?? r.err().toString()).replace(/^Program log: /, "").slice(0, 60)}`);
+      if (process.argv.includes("--verbose")) {
+        for (const l of logs) console.log("      " + l);
+        tx.instructions.forEach((ix, i) => {
+          console.log(`      ix[${i}] ${ix.programId.toBase58()}`);
+          ix.keys.forEach((k, j) => console.log(`         [${j}] ${k.pubkey.toBase58()} ${k.isSigner?"S":" "}${k.isWritable?"W":" "}`));
+        });
+      }
       return null;
     }
     console.log(`  ${label.padEnd(34)} OK      CU ${(r as any).computeUnitsConsumed()}`);
@@ -104,7 +117,55 @@ function arg(n: string, d?: string): string {
     (client as any).state.program.coder.accounts.decode("transferHookPool", Buffer.from(svm.getAccount(pool)!.data)).poolState;
 
   const op = (await client.state.getPool(pool))!.poolState as any;
-  for (const pk of [pool, mint, op.config, op.baseVault, op.quoteVault, ata, t.NATIVE_MINT]) await cloneOne(pk);
+
+  // The pool may be quoted in SOL or in a tokenised stock. Everything below --
+  // what has to be cloned, how the buyer is funded, how amounts are printed --
+  // depends on which, so read it off the config rather than assuming SOL.
+  const cfgState: any = await client.state.getPoolConfig(op.config);
+  const quoteMint: PublicKey = (cfgState.configState ?? cfgState).quoteMint;
+  const isSol = quoteMint.equals(t.NATIVE_MINT);
+  const quoteInfoRpc = await c.getAccountInfo(quoteMint);
+  const quoteProgram = quoteInfoRpc!.owner;
+  const quoteDecimals = (await t.getMint(c, quoteMint, "confirmed", quoteProgram)).decimals;
+  const QUOTE_SYMBOLS: Record<string, string> = {
+    So11111111111111111111111111111111111111112: "SOL",
+    Xs8S1uUs1zvS2p7iwtsG3b6fkhpvmwz4GYU3gWAmWHZ: "QQQx",
+  };
+  const qSym = QUOTE_SYMBOLS[quoteMint.toBase58()] ?? quoteMint.toBase58().slice(0, 8);
+  const qUnit = 10 ** quoteDecimals;
+  const fmtQ = (n: bigint | number) => (Number(n) / qUnit).toFixed(6) + " " + qSym;
+  console.log(`quote: ${qSym} (${quoteDecimals} decimals, ${isSol ? "SPL" : "Token-2022"})\n`);
+
+  for (const pk of [pool, mint, op.config, op.baseVault, op.quoteVault, ata, quoteMint]) await cloneOne(pk);
+  if (!isSol) await cloneOne(deriveTokenBadgeAddress(quoteMint));
+
+  // A SOL swap wraps lamports on the fly. A stock-quoted swap spends from an
+  // existing token account, and the xStock mint authority is Backed's, so the
+  // balance is fabricated directly in the SVM.
+  const quoteAta = t.getAssociatedTokenAddressSync(quoteMint, payer.publicKey, false, quoteProgram, t.ASSOCIATED_TOKEN_PROGRAM_ID);
+  const FUND = 1_000_000n * BigInt(qUnit);
+  if (!isSol) {
+    // A SOL swap wraps lamports on the fly. A stock-quoted swap spends from an
+    // existing token account, and the xStock mint authority is Backed's, so
+    // the buyer has to be funded some other way.
+    //
+    // Let the ATA program build the account rather than hand-rolling one: an
+    // xStock mint carries extensions, so the correct account layout is not
+    // just a bare 165-byte Account, and getting it wrong is rejected with a
+    // misleading "Provided owner is not allowed". Then overwrite the amount
+    // field in place, which is the one thing no instruction would let us do.
+    const mk = new Transaction().add(
+      t.createAssociatedTokenAccountIdempotentInstruction(
+        payer.publicKey, quoteAta, payer.publicKey, quoteMint, quoteProgram, t.ASSOCIATED_TOKEN_PROGRAM_ID));
+    await clone(mk);
+    if (!run(mk, [], "create buyer quote ATA")) process.exit(1);
+    const created = svm.getAccount(quoteAta)!;
+    const data = Buffer.from(created.data);
+    data.writeBigUInt64LE(FUND, 64); // Account.amount
+    svm.setAccount(quoteAta, { ...created, data });
+    seen.add(quoteAta.toBase58());
+    console.log(`  funded buyer with ${fmtQ(FUND)}\n`);
+  }
 
   const swap = async (lamports: bigint, baseForQuote: boolean) =>
     client.pool.swap2WithTransferHook({
@@ -115,24 +176,26 @@ function arg(n: string, d?: string): string {
 
   console.log("MARKET OPEN (Mon 11:00 ET)");
   setClock(OPEN);
-  let tx = await swap(500_000_000n, false); await clone(tx);
-  if (!run(tx, [], "buy 0.5 SOL")) process.exit(1);
+  const BUY = BigInt(qUnit) / 2n; // half a quote token
+  let tx = await swap(BUY, false); await clone(tx);
+  if (!run(tx, [], `buy ${fmtQ(BUY)}`)) process.exit(1);
   const held = bal(ata);
   tx = await swap(held / 2n, true); await clone(tx);
   run(tx, [], "sell half back");
 
   const f = poolState();
   const qFee = BigInt(f.partnerQuoteFee.toString()), bFee = BigInt(f.partnerBaseFee.toString());
-  console.log(`  partner fees accrued:              ${(Number(qFee) / 1e9).toFixed(6)} SOL`);
+  console.log(`  partner fees accrued:              ${fmtQ(qFee)}`);
 
-  const before = svm.getBalance(payer.publicKey)!;
+  const recv = () => (isSol ? svm.getBalance(payer.publicKey)! : bal(quoteAta));
+  const before = recv();
   tx = await client.partner.claimPartnerTradingFee2({
     feeClaimer: payer.publicKey, payer: payer.publicKey, pool, receiver: payer.publicKey,
     maxBaseAmount: new BN(bFee.toString()), maxQuoteAmount: new BN(qFee.toString()),
   });
   await clone(tx);
   if (run(tx, [], "claimPartnerTradingFee2")) {
-    console.log(`  SOL received:                      ${(Number(svm.getBalance(payer.publicKey)! - before) / 1e9).toFixed(6)}`);
+    console.log(`  received:                          ${fmtQ(recv() - before)}`);
   }
 
   // The creator's share is a separate pot with a separate claimer. On a tier
@@ -140,18 +203,18 @@ function arg(n: string, d?: string): string {
   const afterPartner = poolState();
   const cQuote = BigInt(afterPartner.creatorQuoteFee.toString());
   const cBase = BigInt(afterPartner.creatorBaseFee.toString());
-  console.log(`  creator fees accrued:              ${(Number(cQuote) / 1e9).toFixed(6)} SOL`);
+  console.log(`  creator fees accrued:              ${fmtQ(cQuote)}`);
   if (cQuote > 0n || cBase > 0n) {
-    const beforeC = svm.getBalance(payer.publicKey)!;
+    const beforeC = recv();
     tx = await client.creator.claimCreatorTradingFee2({
       creator: payer.publicKey, payer: payer.publicKey, pool, receiver: payer.publicKey,
       maxBaseAmount: new BN(cBase.toString()), maxQuoteAmount: new BN(cQuote.toString()),
     } as any);
     await clone(tx);
     if (run(tx, [], "claimCreatorTradingFee2")) {
-      console.log(`  SOL received:                      ${(Number(svm.getBalance(payer.publicKey)! - beforeC) / 1e9).toFixed(6)}`);
+      console.log(`  received:                          ${fmtQ(recv() - beforeC)}`);
       const left = poolState();
-      console.log(`  creator fees left in pool:         ${(Number(left.creatorQuoteFee) / 1e9).toFixed(6)} SOL`);
+      console.log(`  creator fees left in pool:         ${fmtQ(BigInt(left.creatorQuoteFee.toString()))}`);
     }
   } else {
     console.log("  (this config has a 0% creator share, nothing to claim)");
@@ -159,7 +222,7 @@ function arg(n: string, d?: string): string {
 
   console.log("\nMARKET CLOSED (Sat 11:00 ET)");
   setClock(SATURDAY);
-  tx = await swap(100_000_000n, false); await clone(tx);
+  tx = await swap(BigInt(qUnit) / 10n, false); await clone(tx);
   run(tx, [], "buy (must fail)");
   const f2 = poolState();
   tx = await client.partner.claimPartnerTradingFee2({
