@@ -353,9 +353,13 @@ async function main() {
   // --ledger signs on the device; otherwise a keypair file is used.
   const useLedger = process.argv.includes("--ledger");
   const ledgerPath = arg("ledger-path", DEFAULT_LEDGER_PATH);
+  // Default the expected device address to the launch Ledger, so a wrong
+  // derivation path is caught before anything is signed rather than producing
+  // a confusing failure further in.
   const expectAddr = (() => {
     const i = process.argv.indexOf("--expect");
-    return i !== -1 && process.argv[i + 1] ? new PublicKey(process.argv[i + 1]) : undefined;
+    if (i !== -1 && process.argv[i + 1]) return new PublicKey(process.argv[i + 1]);
+    return PLATFORM_FEE_CLAIMER;
   })();
   const signer: Signer = useLedger
     ? ledgerSigner(await openLedger(ledgerPath, expectAddr))

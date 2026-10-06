@@ -5,16 +5,21 @@
  * hardware wallet. This signs the transaction message on the device instead, so
  * the key never leaves it.
  *
- * Derivation path: the Solana CLI's `usb://ledger?key=N` maps to
- * 44'/501'/N'/0'. The default here matches `usb://ledger?key=0`. If the address
- * that comes back is not the one you expect, the path is wrong -- pass
- * --ledger-path rather than guessing, and never proceed on a mismatch.
+ * Derivation path: the Solana CLI's `usb://ledger?key=N` maps to 44'/501'/N'
+ * -- THREE levels, not four. `usb://ledger?key=N/M` is the four-level
+ * 44'/501'/N'/M'. They are different accounts on the same device: this repo
+ * previously defaulted to the four-level form, which on the launch Ledger is a
+ * different, empty address.
+ *
+ * Confirmed by querying the device at both paths. If the address that comes
+ * back is not the one you expect, the path is wrong -- pass --ledger-path
+ * rather than guessing, and never proceed on a mismatch.
  */
 import TransportNodeHid from "@ledgerhq/hw-transport-node-hid";
 import Solana from "@ledgerhq/hw-app-solana";
 import { PublicKey, Transaction, Connection } from "@solana/web3.js";
 
-export const DEFAULT_LEDGER_PATH = "44'/501'/0'/0'";
+export const DEFAULT_LEDGER_PATH = "44'/501'/0'";
 
 export type LedgerSigner = {
   publicKey: PublicKey;
