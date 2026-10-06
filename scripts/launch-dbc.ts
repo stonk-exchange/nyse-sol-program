@@ -219,6 +219,71 @@ function buildCurveConfig(opts: {
   } as any);
 }
 
+/**
+ * Take the PRICE curve from an existing DBC config.
+ *
+ * The builders force a choice we do not want to make. buildCurveWithMarketCap
+ * sets the starting market cap correctly but derives a migration threshold far
+ * too low to be unreachable; buildCurve takes the threshold we need but derives
+ * the start price from a supply percentage, which on a 100,000 SOL threshold
+ * puts the opening valuation about a thousand times too high. Neither gives
+ * both.
+ *
+ * hours.fun achieves both with a single long curve segment -- opening near a 30
+ * SOL market cap and running to roughly 593,000,000 SOL before the threshold is
+ * reached. Rather than reverse-engineer that, copy it: the numbers are public
+ * on chain, and matching them is the point.
+ *
+ * Only the three price fields are taken. Fees, LP split, creator share and the
+ * fee claimer all stay ours, so the reference must agree on everything the
+ * curve depends on -- decimals, supply and LP distribution -- or the curve will
+ * not absorb exactly the threshold it claims.
+ */
+async function curveFromReference(
+  connection: Connection,
+  client: DynamicBondingCurveClient,
+  reference: PublicKey,
+  mine: any
+) {
+  const ref: any = await client.state.getPoolConfig(reference);
+  if (!ref) throw new Error(`no DBC config at ${reference.toBase58()}`);
+  const rs = ref.configState ?? ref;
+
+  const mismatches: string[] = [];
+  const cmp = (what: string, a: any, b: any) => {
+    if (String(a) !== String(b)) mismatches.push(`${what}: reference ${a}, ours ${b}`);
+  };
+  cmp("tokenDecimal", rs.tokenDecimal, mine.tokenDecimal);
+  cmp("tokenType", rs.tokenType, mine.tokenType);
+  cmp("preMigrationTokenSupply", rs.preMigrationTokenSupply, mine.tokenSupply?.preMigrationTokenSupply);
+  cmp("partnerPermanentLockedLiquidityPercentage", rs.partnerPermanentLockedLiquidityPercentage, mine.partnerPermanentLockedLiquidityPercentage);
+  cmp("partnerLiquidityPercentage", rs.partnerLiquidityPercentage, mine.partnerLiquidityPercentage);
+  cmp("creatorPermanentLockedLiquidityPercentage", rs.creatorPermanentLockedLiquidityPercentage, mine.creatorPermanentLockedLiquidityPercentage);
+  cmp("creatorLiquidityPercentage", rs.creatorLiquidityPercentage, mine.creatorLiquidityPercentage);
+  cmp("migrationOption", rs.migrationOption, mine.migrationOption);
+  cmp("migrationFeeOption", rs.migrationFeeOption, mine.migrationFeeOption);
+  if (mismatches.length) {
+    throw new Error(
+      `reference config ${reference.toBase58()} is not curve-compatible:\n` +
+        mismatches.map((m) => `    ${m}`).join("\n") +
+        `\n  A curve only absorbs its stated threshold under the shape it was built for.`
+    );
+  }
+
+  // The on-chain curve is a fixed-length array padded with zero points. Passing
+  // the padding back in fails validation with "SafeMath: subtraction overflow",
+  // because a zero sqrtPrice reads as a segment that steps backwards.
+  const points = rs.curve.filter((p: any) => p.sqrtPrice?.toString() !== "0");
+  if (!points.length) throw new Error(`reference config ${reference.toBase58()} has an empty curve`);
+
+  return {
+    ...mine,
+    sqrtStartPrice: rs.sqrtStartPrice,
+    curve: points,
+    migrationQuoteThreshold: rs.migrationQuoteThreshold,
+  };
+}
+
 function arg(name: string, fallback?: string): string {
   const i = process.argv.indexOf(`--${name}`);
   if (i !== -1 && process.argv[i + 1]) return process.argv[i + 1];
@@ -368,6 +433,7 @@ async function main() {
         `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)\n` +
         `  --quote  <${Object.keys(QUOTES).join("|")}>  (or --quote-mint <ADDRESS>)\n` +
         `  --threshold <QUOTE TOKENS>  graduation point; keep it unreachable (default 100000)\n` +
+        `  --curve-from <CONFIG>  copy the price curve from an existing DBC config\n` +
         `  --fee-claimer <ADDRESS>  platform fee destination (permanent; default the Ledger)\n` +
         `  --ledger [--ledger-path "44'/501'/0'/0'"] [--expect <ADDRESS>]`
     );
@@ -447,13 +513,22 @@ async function main() {
 
     const migrationThreshold = Number(arg("threshold", "100000"));
     const supplyOnMigrationPct = Number(arg("supply-on-migration", "20"));
-    const curve = buildCurveConfig({
+    let curve: any = buildCurveConfig({
       quoteDecimals: quote.decimals,
       migrationThreshold,
       supplyOnMigrationPct,
       cliffFeeNumerator: FEE_TIERS[tier].cliffFeeNumerator,
       creatorSharePct: FEE_TIERS[tier].creatorSharePct,
     });
+    // --curve-from copies the price curve off an existing config. Without it
+    // the derived curve opens roughly a thousand times too high at a 100,000
+    // threshold, which is how the first mainnet launch went out at a ~$3.7m
+    // valuation instead of ~$3.6k.
+    const curveFrom = arg("curve-from", "");
+    if (curveFrom) {
+      curve = await curveFromReference(connection, client, new PublicKey(curveFrom), curve);
+    }
+
     // The builder returns `undefined` rather than throwing when it does not
     // recognise an input field, so check its output instead of trusting it.
     const lp = [
@@ -490,7 +565,12 @@ async function main() {
     console.log(`    creator gets ${split.creator.toFixed(3)}%`);
     console.log(`    you get      ${split.platform.toFixed(3)}%`);
     console.log(`    Meteora gets ${(split.total * 0.2).toFixed(3)}% (20% protocol fee)`);
-    console.log(`  supply on migration ${supplyOnMigrationPct}% (the rest sells on the curve)`);
+    const sqrtStart = Number(curve.sqrtStartPrice.toString()) / 2 ** 64;
+    const startPrice = sqrtStart * sqrtStart * 10 ** (BASE_DECIMALS - quote.decimals);
+    const startFdv = startPrice * SUPPLY;
+    console.log(`  curve source   ${curveFrom ? curveFrom + " (copied price curve)" : "derived"}`);
+    console.log(`  OPENING VALUATION ${startFdv.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${quoteLabel}`);
+    console.log(`                 what the first buyer pays for the whole supply.`);
     console.log(`  graduates at   ${threshold.toLocaleString()} ${quoteLabel}`);
     console.log(`                 DBC strips the hook when a curve completes, which would`);
     console.log(`                 end the trading hours. Keep this out of reach.`);
