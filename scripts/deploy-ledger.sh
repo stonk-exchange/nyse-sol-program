@@ -123,44 +123,59 @@ fi
 step "confirm the Ledger"
 
 say "Unlock the Ledger and open the Solana app."
-if [ "$EXECUTE" = "1" ]; then
-  # The CLI's key= index and a BIP44 path are not the same thing:
-  # usb://ledger?key=0 is 44'/501'/0', while usb://ledger?key=0/0 is
-  # 44'/501'/0'/0'. They are different addresses on the same device, and the
-  # rest of this repo's tooling defaults to the four-level form. Rather than
-  # pick one and hand authority to whatever answers, probe the standard forms
-  # and use the one that actually holds --expect.
-  if [ -n "$EXPECT_LEDGER" ]; then
-    FOUND=""
-    TRIED=""
-    for CAND in "$LEDGER_URL" "usb://ledger?key=0/0" "usb://ledger?key=0" "usb://ledger"; do
-      CAND_ADDR="$(solana address --keypair "$CAND" 2>/dev/null)" || continue
-      TRIED="${TRIED}
-    ${CAND}  ->  ${CAND_ADDR}"
-      if [ "$CAND_ADDR" = "$EXPECT_LEDGER" ]; then
-        FOUND="$CAND"
-        break
-      fi
-    done
-    [ -n "$TRIED" ] || die "cannot read the Ledger (unlocked? Solana app open? cable seated?)"
-    [ -n "$FOUND" ] || die "none of the standard derivation paths hold $EXPECT_LEDGER:$TRIED
 
-  Handing authority to the wrong address would make the program permanently
-  unupgradeable by you, so nothing has been sent. Pass the right path with
-  --ledger-url, or the right address with --expect."
-    LEDGER_URL="$FOUND"
-    LEDGER_ADDR="$EXPECT_LEDGER"
-    say "derivation path     $LEDGER_URL"
-    say "device address      $LEDGER_ADDR (matches --expect)"
+# The CLI's key= index and a BIP44 path are not the same thing:
+# usb://ledger?key=0 is 44'/501'/0', while usb://ledger?key=0/0 is
+# 44'/501'/0'/0'. They are different addresses on the same device, and the rest
+# of this repo's tooling defaults to the four-level form. Rather than pick one
+# and hand authority to whatever answers, probe the standard forms and use the
+# one that actually holds --expect.
+#
+# Reading an address is read-only -- no transaction, no device prompt -- so the
+# dry run does it too. The derivation path is the one thing worth confirming
+# BEFORE committing 2.45 SOL to a buffer, and a dry run that only echoed
+# --expect back was the least useful line in this script.
+probe_ledger() {
+  FOUND=""
+  TRIED=""
+  for CAND in "$LEDGER_URL" "usb://ledger?key=0/0" "usb://ledger?key=0" "usb://ledger"; do
+    CAND_ADDR="$(solana address --keypair "$CAND" 2>/dev/null)" || continue
+    TRIED="${TRIED}
+    ${CAND}  ->  ${CAND_ADDR}"
+    if [ -z "$EXPECT_LEDGER" ] || [ "$CAND_ADDR" = "$EXPECT_LEDGER" ]; then
+      FOUND="$CAND"
+      FOUND_ADDR="$CAND_ADDR"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if probe_ledger; then
+  LEDGER_URL="$FOUND"
+  LEDGER_ADDR="$FOUND_ADDR"
+  say "derivation path     $LEDGER_URL"
+  if [ -n "$EXPECT_LEDGER" ]; then
+    say "device address      $LEDGER_ADDR (read from the device, matches --expect)"
   else
-    LEDGER_ADDR="$(solana address --keypair "$LEDGER_URL" 2>/dev/null)" \
-      || die "cannot read the Ledger at $LEDGER_URL (unlocked? Solana app open?)"
-    say "device address      $LEDGER_ADDR"
+    say "device address      $LEDGER_ADDR (read from the device)"
     say "WARNING: no --expect given, so this address is unverified."
   fi
+elif [ -n "$TRIED" ]; then
+  # The device answered, but nothing on it is the address we were told to use.
+  # That is fatal either way: handing authority to the wrong address makes the
+  # program permanently unupgradeable by its owner.
+  die "none of the standard derivation paths hold $EXPECT_LEDGER:$TRIED
+
+  Nothing has been sent. Pass the right path with --ledger-url, or the right
+  address with --expect."
+elif [ "$EXECUTE" = "1" ]; then
+  die "cannot read the Ledger (unlocked? Solana app open? cable seated?)"
 else
   LEDGER_ADDR="${EXPECT_LEDGER:-<device>}"
-  say "device address      $LEDGER_ADDR (not read; dry run)"
+  say "device address      $LEDGER_ADDR (NOT VERIFIED -- no device reachable)"
+  say "Plug in and unlock the Ledger and re-run to confirm the derivation path"
+  say "before spending anything."
 fi
 
 if [ "$EXECUTE" != "1" ]; then
