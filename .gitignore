@@ -94,3 +94,7 @@ fixtures/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Launch receipts: localnet runs and per-token records
+dbc-config-*.json
+dbc-token-*.json
