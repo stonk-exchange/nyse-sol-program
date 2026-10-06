@@ -274,7 +274,21 @@ this and will refuse to initialise otherwise. The test suite includes a mutation
 check showing why: if that authority survives, the hook can be repointed at a
 no-op program and the market-hours restriction disappears entirely.
 
-### 3. Create the market registry
+### 3a. Metadata
+
+The `--uri` you pass must be a **live URL serving JSON**. DBC writes the name,
+symbol and that URL into the mint itself at pool creation, and the config sets
+`tokenUpdateAuthority: Immutable`, so **none of the three can ever be changed
+afterwards**. Wallets and explorers fetch the URL to get the description and
+image.
+
+Shape it like [`metadata-example.json`](metadata-example.json) — at minimum
+`name`, `symbol`, `description` and `image`. Host it anywhere stable and
+publicly reachable; the file in this repo has placeholder URLs and is a template,
+not a working target. If the URL dies later the token still trades, but it loses
+its image and description everywhere.
+
+### 3b. Create the market registry
 
 Only `REGISTRY_BOOTSTRAP` — the launch Ledger, `FTnprQrxXRGBAJRg8axCbocBNeSvQC3YoCFqEE8khJ3c` —
 can do this, and only once. Do it before burning the upgrade authority: if the

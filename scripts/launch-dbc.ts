@@ -30,7 +30,9 @@ import {
 } from "@solana/web3.js";
 import { NATIVE_MINT } from "@solana/spl-token";
 import { market, MARKETS } from "./markets/presets";
-import { initializeScheduleIx, extraAccountMetasAddress } from "./markets/hook";
+import {
+  initializeScheduleIx, extraAccountMetasAddress, initializeRegistryIx, registryAddress,
+} from "./markets/hook";
 import {
   DynamicBondingCurveClient,
   deriveDbcPoolAddress,
@@ -189,9 +191,9 @@ function configParameters(feeClaimer: PublicKey, tier: TierId) {
 
 async function main() {
   const cmd = process.argv[2];
-  if (cmd !== "config" && cmd !== "token" && cmd !== "claim") {
+  if (!["config", "token", "claim", "registry"].includes(cmd)) {
     throw new Error(
-      `usage: launch-dbc.ts <config|token|claim> [...]\n` +
+      `usage: launch-dbc.ts <config|token|claim|registry> [...]\n` +
         `  --market <${Object.keys(MARKETS).join("|")}>\n` +
         `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)`
     );
@@ -258,6 +260,37 @@ async function main() {
     return;
   }
 
+  if (cmd === "registry") {
+    // One-off: create the market registry and name its authority.
+    //
+    // The signer must be REGISTRY_BOOTSTRAP, compiled into the program. Its
+    // only power is this one call, and the authority it names takes over
+    // immediately -- so point --authority at the Ledger even if a hot key
+    // signs here.
+    const authority = new PublicKey(arg("authority", wallet.publicKey.toBase58()));
+    const registry = registryAddress();
+
+    console.log("create market registry");
+    console.log(`  endpoint   ${endpoint}`);
+    console.log(`  signer     ${wallet.publicKey.toBase58()}  (must be REGISTRY_BOOTSTRAP)`);
+    console.log(`  registry   ${registry.toBase58()}`);
+    console.log(`  authority  ${authority.toBase58()}  <-- may approve markets from now on`);
+
+    if (await connection.getAccountInfo(registry)) {
+      console.log("\nRegistry already exists. Nothing to do.");
+      return;
+    }
+    if (!execute) { console.log("\nDry run. Add --execute to send."); return; }
+
+    const sig = await sendAndConfirmTransaction(
+      connection,
+      new Transaction().add(initializeRegistryIx(wallet.publicKey, authority)),
+      [wallet]
+    );
+    console.log("\nregistry created:", sig);
+    return;
+  }
+
   if (cmd === "claim") {
     // Trading fees accrue inside the pool and have to be pulled out. The
     // partner's share and the creator's share are separate pots with separate
@@ -305,6 +338,10 @@ async function main() {
   // program upgrade; the choice is fixed for the life of the token.
   const marketId = arg("market", "nyse");
   const chosen = market(marketId);
+  // The pool creator owns the creator share of trading fees FOREVER. The
+  // signer here is a throwaway hot wallet, so defaulting this to the signer
+  // would quietly send that share to a key you intend to discard.
+  const creator = new PublicKey(arg("creator", wallet.publicKey.toBase58()));
   const baseMint = Keypair.generate();
   const pool = deriveDbcPoolAddress(NATIVE_MINT, baseMint.publicKey, config);
 
@@ -317,6 +354,12 @@ async function main() {
   console.log(`  uri            ${uri}`);
   console.log(`  market         ${chosen.label}`);
   console.log(`  transfer hook  ${HOOK_PROGRAM_ID.toBase58()}`);
+  console.log(`  pool creator   ${creator.toBase58()}  <-- owns the creator fee share`);
+  if (creator.equals(wallet.publicKey)) {
+    console.log(`                 WARNING: that is the signing wallet. If this is a`);
+    console.log(`                 throwaway hot key, pass --creator <your address>`);
+    console.log(`                 or the creator fees are stranded there.`);
+  }
 
   if (!execute) { console.log("\nDry run. Add --execute to send."); return; }
 
@@ -325,7 +368,7 @@ async function main() {
     config,
     name, symbol, uri,
     payer: wallet.publicKey,
-    poolCreator: wallet.publicKey,
+    poolCreator: creator,
     transferHookProgram: HOOK_PROGRAM_ID,
   });
   const sig = await sendAndConfirmTransaction(connection, tx, [wallet, baseMint]);
