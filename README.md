@@ -91,8 +91,11 @@ npm run check:tzdata   # verify the hardcoded DST rule against tzdata
 npm run gen:table      # regenerate the table
 ```
 
-A differential of the implementation against tzdata over 525,888 five-minute
-slots spanning 2026–2031 matches exactly.
+A differential of the implementation against tzdata over **2,208,960**
+five-minute slots — every five minutes from 2026-01-01 to 2047-01-01, the
+entire generated holiday horizon — matches exactly, with zero mismatches. That
+exercises all 207 NYSE holidays and all 42 daylight-saving transitions in the
+table.
 
 **36 integration tests** running the compiled program under LiteSVM with a
 controlled clock. They attempt real Token-2022 transfers at each market state

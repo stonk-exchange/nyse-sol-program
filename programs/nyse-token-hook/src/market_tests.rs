@@ -386,3 +386,29 @@ fn malformed_events_are_rejected() {
     };
     assert!(too_many.validate().is_err());
 }
+
+/// The generated holiday table must cover every year it claims to, with no
+/// gaps. The 2.2M-slot differential against tzdata is run out of band (see
+/// README); this guards the data the differential depends on.
+#[test]
+fn holiday_table_has_no_gaps_across_the_horizon() {
+    let s = nyse_schedule();
+    let mut per_year = std::collections::BTreeMap::new();
+    for off in s.holidays.iter() {
+        let (y, _, _) = civil_from_days(s.base_day as i64 + *off as i64);
+        *per_year.entry(y).or_insert(0) += 1;
+    }
+    let first = *per_year.keys().next().unwrap();
+    let last = *per_year.keys().last().unwrap();
+    assert_eq!(first, 2026, "horizon should start in 2026");
+    assert!(last >= 2046, "horizon should reach 2046, got {last}");
+    for y in first..=last {
+        let n = per_year.get(&y).copied().unwrap_or(0);
+        // NYSE observes 9 or 10 full closures a year: New Year's is not
+        // observed when 1 January falls on a Saturday.
+        assert!(
+            (9..=10).contains(&n),
+            "{y} has {n} holidays, expected 9 or 10"
+        );
+    }
+}
