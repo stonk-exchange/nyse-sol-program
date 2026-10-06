@@ -27,7 +27,8 @@
 # USAGE
 #   ./scripts/deploy-ledger.sh                      # dry run, prints the plan
 #   ./scripts/deploy-ledger.sh --execute            # devnet
-#   ./scripts/deploy-ledger.sh --execute --cluster mainnet-beta
+#   ./scripts/deploy-ledger.sh --execute --cluster mainnet-beta \
+#     --payer ~/.config/solana/nyse-deploy-hot.json
 #
 # Each stage is skipped if it is already done, so a failure part-way through can
 # be resumed by re-running the same command.
@@ -39,6 +40,9 @@ EXECUTE=0
 LEDGER_URL="usb://ledger?key=0"
 EXPECT_LEDGER="FTnprQrxXRGBAJRg8axCbocBNeSvQC3YoCFqEE8khJ3c"
 BURN=1
+# The wallet that pays for and uploads the buffer. Kept separate from the
+# global CLI default so a deploy cannot quietly spend the wrong key.
+PAYER_KEYPAIR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,6 +51,7 @@ while [ $# -gt 0 ]; do
     --ledger-url) LEDGER_URL="$2"; shift 2 ;;
     --expect) EXPECT_LEDGER="$2"; shift 2 ;;
     --no-burn) BURN=0; shift ;;
+    --payer) PAYER_KEYPAIR="$2"; shift 2 ;;
     -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -61,6 +66,13 @@ PROGRAM_KEYPAIR="target/deploy/nyse_token_hook-keypair.json"
 # The cluster may be a URL, so slugify it for the filename.
 CLUSTER_SLUG="$(printf '%s' "$CLUSTER" | tr -c 'A-Za-z0-9._-' '_')"
 STATE="target/deploy/.ledger-deploy-${CLUSTER_SLUG}.buffer"
+
+# Passed to every solana call that spends. Empty means "the CLI default".
+PAYER_ARGS=()
+if [ -n "$PAYER_KEYPAIR" ]; then
+  [ -f "$PAYER_KEYPAIR" ] || { echo "no payer keypair at $PAYER_KEYPAIR" >&2; exit 1; }
+  PAYER_ARGS=(--keypair "$PAYER_KEYPAIR")
+fi
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -103,9 +115,10 @@ else
   say "on chain            not deployed"
 fi
 
-PAYER="$(solana address)"
+PAYER="$(solana address "${PAYER_ARGS[@]+"${PAYER_ARGS[@]}"}")"
 PAYER_BAL="$(solana balance "$PAYER" --url "$CLUSTER" | awk '{print $1}')"
 say "hot wallet (payer)  $PAYER  ${PAYER_BAL} SOL"
+say "payer keypair       ${PAYER_KEYPAIR:-<solana CLI default>}"
 
 # Measured on a fork: a 335 KB deploy costs ~2.336 SOL, nearly all of it the
 # programdata rent, which the buffer holds first and hands over on deploy.
@@ -216,7 +229,7 @@ if [ -z "$BUFFER" ]; then
   solana-keygen new --no-bip39-passphrase -s -o "$BUFFER_KP" --force >/dev/null
   BUFFER="$(solana-keygen pubkey "$BUFFER_KP")"
   say "buffer              $BUFFER"
-  solana program write-buffer "$SO" \
+  solana program write-buffer "$SO" "${PAYER_ARGS[@]+"${PAYER_ARGS[@]}"}" \
     --buffer "$BUFFER_KP" --url "$CLUSTER" >/dev/null \
     || die "buffer upload failed. Re-run to resume."
   # The buffer is now self-contained on chain; its keypair signs nothing else,
@@ -258,12 +271,12 @@ say "matches the local build."
 
 step "3/6  transfer buffer authority to the Ledger"
 
-CUR_BUF_AUTH="$(solana program show --buffers --url "$CLUSTER" 2>/dev/null \
+CUR_BUF_AUTH="$(solana program show --buffers "${PAYER_ARGS[@]+"${PAYER_ARGS[@]}"}" --url "$CLUSTER" 2>/dev/null \
   | awk -v b="$BUFFER" '$1 == b {print $3}')"
 if [ "$CUR_BUF_AUTH" = "$LEDGER_ADDR" ]; then
   say "already set to $LEDGER_ADDR"
 else
-  solana program set-buffer-authority "$BUFFER" \
+  solana program set-buffer-authority "$BUFFER" "${PAYER_ARGS[@]+"${PAYER_ARGS[@]}"}" \
     --new-buffer-authority "$LEDGER_ADDR" --url "$CLUSTER" >/dev/null \
     || die "could not transfer buffer authority"
   say "buffer authority    $LEDGER_ADDR"
@@ -276,7 +289,7 @@ step "4/6  deploy  <-- LEDGER PRESS 1"
 say "Approve on the device. The hot wallet pays the fee; the Ledger authorises"
 say "the deploy and becomes the upgrade authority."
 
-solana program deploy \
+solana program deploy "${PAYER_ARGS[@]+"${PAYER_ARGS[@]}"}" \
   --buffer "$BUFFER" \
   --program-id "$PROGRAM_KEYPAIR" \
   --upgrade-authority "$LEDGER_URL" \
@@ -300,7 +313,7 @@ if [ "$BURN" != "1" ]; then
   step "6/6  skipped (--no-burn)"
   say "The Ledger is the upgrade authority. Burn it when you are ready:"
   say "  solana program set-upgrade-authority $PROGRAM_ID --final \\"
-  say "    --upgrade-authority $LEDGER_URL --url $CLUSTER"
+  say "    ${PAYER_KEYPAIR:+--keypair $PAYER_KEYPAIR }--upgrade-authority $LEDGER_URL --url $CLUSTER"
   exit 0
 fi
 
@@ -320,6 +333,7 @@ read -r CONFIRM
 [ "$CONFIRM" = "BURN" ] || die "not confirmed; the Ledger is still the upgrade authority"
 
 solana program set-upgrade-authority "$PROGRAM_ID" --final \
+  "${PAYER_ARGS[@]+"${PAYER_ARGS[@]}"}" \
   --upgrade-authority "$LEDGER_URL" --url "$CLUSTER" \
   || die "could not burn the authority"
 
