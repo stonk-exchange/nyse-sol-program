@@ -340,9 +340,27 @@ Each tier is a separate DBC config, created once and reused for every token on
 it. Partner and creator fees are separate pots with separate claimers — see
 `claim` below.
 
+### Signing with a Ledger
+
+Add `--ledger` to any command and the device signs; the key never leaves it.
+
+```bash
+npx ts-node scripts/launch-dbc.ts config --ledger \
+  --expect FTnprQrxXRGBAJRg8axCbocBNeSvQC3YoCFqEE8khJ3c ...
+```
+
+Unlock the device and open the Solana app first. `--expect` is worth passing on
+anything that sets a permanent address: the script derives the device's address
+and **refuses to sign** if it differs, because a wrong derivation path would
+otherwise put a permanent fee claimer or registry authority on an address you do
+not control. Default path is `44'/501'/0'/0'`, matching the CLI's
+`usb://ledger?key=0`; override with `--ledger-path`.
+
+Without `--ledger`, commands load a keypair from `ANCHOR_WALLET`.
+
 ```bash
 # once per tier: create a partner config. You are the fee claimer.
-ANCHOR_WALLET=./hot.json npx ts-node scripts/launch-dbc.ts config \
+npx ts-node scripts/launch-dbc.ts config --ledger \
   --cluster mainnet-beta --fee-claimer <YOUR_LEDGER_ADDRESS> --tier 1 --execute
 
 # per token, reusing that config forever

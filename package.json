@@ -34,6 +34,8 @@
   },
   "devDependencies": {
     "@coral-xyz/anchor": "^0.32.1",
+    "@ledgerhq/hw-app-solana": "^7.12.0",
+    "@ledgerhq/hw-transport-node-hid": "^6.33.5",
     "@meteora-ag/dynamic-bonding-curve-sdk": "^1.5.13",
     "@orca-so/whirlpools-sdk": "^0.22.0",
     "@types/bn.js": "^5.1.0",

@@ -33,6 +33,7 @@ import { market, MARKETS } from "./markets/presets";
 import {
   initializeScheduleIx, extraAccountMetasAddress, initializeRegistryIx, registryAddress,
 } from "./markets/hook";
+import { openLedger, sendWithLedger, DEFAULT_LEDGER_PATH, LedgerSigner } from "./markets/ledger";
 import {
   DynamicBondingCurveClient,
   deriveDbcPoolAddress,
@@ -124,6 +125,39 @@ function arg(name: string, fallback?: string): string {
   throw new Error(`missing required --${name}`);
 }
 
+/**
+ * Either a keypair from a file or a Ledger. The device cannot hand over a
+ * secret key, so sending goes through a function rather than a Keypair.
+ */
+type Signer = {
+  publicKey: PublicKey;
+  send(connection: Connection, tx: Transaction, extra?: Keypair[]): Promise<string>;
+  close(): Promise<void>;
+  isLedger: boolean;
+};
+
+function fileSigner(kp: Keypair): Signer {
+  return {
+    publicKey: kp.publicKey,
+    isLedger: false,
+    async send(connection, tx, extra = []) {
+      return sendAndConfirmTransaction(connection, tx, [kp, ...extra]);
+    },
+    async close() {},
+  };
+}
+
+function ledgerSigner(l: LedgerSigner): Signer {
+  return {
+    publicKey: l.publicKey,
+    isLedger: true,
+    async send(connection, tx, extra = []) {
+      return sendWithLedger(connection, tx, l, extra as any);
+    },
+    close: l.close,
+  };
+}
+
 function loadWallet(): Keypair {
   const path = (process.env.ANCHOR_WALLET ?? `${os.homedir()}/.config/solana/id.json`).replace(/^~/, os.homedir());
   if (!fs.existsSync(path)) throw new Error(`wallet not found at ${path}; set ANCHOR_WALLET`);
@@ -195,12 +229,23 @@ async function main() {
     throw new Error(
       `usage: launch-dbc.ts <config|token|claim|registry> [...]\n` +
         `  --market <${Object.keys(MARKETS).join("|")}>\n` +
-        `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)`
+        `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)\n` +
+        `  --ledger [--ledger-path "44'/501'/0'/0'"] [--expect <ADDRESS>]`
     );
   }
   const cluster = arg("cluster", "devnet") as "devnet" | "mainnet-beta";
   const execute = process.argv.includes("--execute");
-  const wallet = loadWallet();
+  // --ledger signs on the device; otherwise a keypair file is used.
+  const useLedger = process.argv.includes("--ledger");
+  const ledgerPath = arg("ledger-path", DEFAULT_LEDGER_PATH);
+  const expectAddr = (() => {
+    const i = process.argv.indexOf("--expect");
+    return i !== -1 && process.argv[i + 1] ? new PublicKey(process.argv[i + 1]) : undefined;
+  })();
+  const signer: Signer = useLedger
+    ? ledgerSigner(await openLedger(ledgerPath, expectAddr))
+    : fileSigner(loadWallet());
+  const wallet = { publicKey: signer.publicKey };
   // --rpc overrides the cluster endpoint, so the whole flow can be rehearsed
   // against a local validator with the DBC program cloned in.
   const endpoint = arg("rpc", clusterApiUrl(cluster));
@@ -247,7 +292,7 @@ async function main() {
       quoteMint: NATIVE_MINT,
       transferHookProgram: HOOK_PROGRAM_ID,
     });
-    const sig = await sendAndConfirmTransaction(connection, tx, [wallet, config]);
+    const sig = await signer.send(connection, tx, [config]);
     console.log("\nconfig created:", sig);
     console.log("config address:", config.publicKey.toBase58());
     fs.writeFileSync(`dbc-config-${cluster}-${tier}.json`, JSON.stringify({
@@ -272,7 +317,7 @@ async function main() {
 
     console.log("create market registry");
     console.log(`  endpoint   ${endpoint}`);
-    console.log(`  signer     ${wallet.publicKey.toBase58()}  (must be REGISTRY_BOOTSTRAP)`);
+    console.log(`  signer     ${wallet.publicKey.toBase58()}${signer.isLedger ? " (Ledger)" : ""}  (must be REGISTRY_BOOTSTRAP)`);
     console.log(`  registry   ${registry.toBase58()}`);
     console.log(`  authority  ${authority.toBase58()}  <-- may approve markets from now on`);
 
@@ -282,10 +327,9 @@ async function main() {
     }
     if (!execute) { console.log("\nDry run. Add --execute to send."); return; }
 
-    const sig = await sendAndConfirmTransaction(
+    const sig = await signer.send(
       connection,
-      new Transaction().add(initializeRegistryIx(wallet.publicKey, authority)),
-      [wallet]
+      new Transaction().add(initializeRegistryIx(wallet.publicKey, authority))
     );
     console.log("\nregistry created:", sig);
     return;
@@ -325,7 +369,7 @@ async function main() {
       as === "creator"
         ? await client.creator.claimCreatorTradingFee2({ ...params, creator: wallet.publicKey })
         : await client.partner.claimPartnerTradingFee2({ ...params, feeClaimer: wallet.publicKey });
-    console.log("\nclaimed:", await sendAndConfirmTransaction(connection, tx, [wallet]));
+    console.log("\nclaimed:", await signer.send(connection, tx));
     return;
   }
 
@@ -371,14 +415,13 @@ async function main() {
     poolCreator: creator,
     transferHookProgram: HOOK_PROGRAM_ID,
   });
-  const sig = await sendAndConfirmTransaction(connection, tx, [wallet, baseMint]);
+  const sig = await signer.send(connection, tx, [baseMint]);
   console.log("\npool created:", sig);
 
   // Must happen before anyone can trade.
-  const initSig = await sendAndConfirmTransaction(
+  const initSig = await signer.send(
     connection,
-    new Transaction().add(initializeScheduleIx(baseMint.publicKey, wallet.publicKey, chosen)),
-    [wallet]
+    new Transaction().add(initializeScheduleIx(baseMint.publicKey, wallet.publicKey, chosen))
   );
   console.log("schedule + hook state written:", initSig);
 
