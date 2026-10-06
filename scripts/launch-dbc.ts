@@ -62,6 +62,20 @@ import * as os from "os";
 const HOOK_PROGRAM_ID = new PublicKey("CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k");
 
 /**
+ * Where the platform's share of every trade goes.
+ *
+ * This is written into the DBC config at creation and CANNOT be changed: the
+ * program has no instruction for it (transfer_pool_creator moves the creator
+ * side, but nothing moves the fee claimer). Every token launched on a config
+ * pays its platform fee here forever.
+ *
+ * Claiming requires this address to SIGN, so it has to be a wallet whose key
+ * you hold -- not a PDA, not a multisig you cannot sign for, and not a hot
+ * wallet you intend to throw away.
+ */
+const PLATFORM_FEE_CLAIMER = new PublicKey("FTnprQrxXRGBAJRg8axCbocBNeSvQC3YoCFqEE8khJ3c");
+
+/**
  * Curve parameters.
  *
  * The sqrtStartPrice and curve points are taken verbatim from a live
@@ -250,6 +264,48 @@ function loadWallet(): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(path, "utf8"))));
 }
 
+/**
+ * Refuse an address that could never claim what is assigned to it.
+ *
+ * Both the fee claimer and the pool creator have to sign to collect, and both
+ * are effectively permanent. The failure mode is silent -- fees accrue
+ * normally and simply cannot be withdrawn -- so the checks happen up front.
+ */
+async function assertClaimable(
+  connection: Connection,
+  addr: PublicKey,
+  signer: Signer,
+  role: string
+) {
+  // Off-curve addresses are PDAs. A PDA has no secret key, so nothing can ever
+  // produce its signature.
+  if (!PublicKey.isOnCurve(addr.toBytes())) {
+    throw new Error(
+      `${role} ${addr.toBase58()} is off-curve (a PDA).\n` +
+        `  Claiming needs its signature, which no one can produce. Use a wallet address.`
+    );
+  }
+  const info = await connection.getAccountInfo(addr);
+  if (info && !info.owner.equals(SystemProgram.programId)) {
+    throw new Error(
+      `${role} ${addr.toBase58()} is owned by ${info.owner.toBase58()}, not the System Program.\n` +
+        `  That is a program or token account, not a wallet, and it cannot sign a claim.`
+    );
+  }
+  // A file keypair is a hot wallet. Assigning permanent fee income to the key
+  // that happens to be running the script is almost never deliberate.
+  if (!signer.isLedger && addr.equals(signer.publicKey)) {
+    if (!process.argv.includes("--allow-hot-fee-claimer")) {
+      throw new Error(
+        `${role} is the hot wallet signing this (${addr.toBase58()}).\n` +
+          `  This is permanent. If that key is a throwaway, the income is gone with it.\n` +
+          `  Pass --fee-claimer <your wallet>, or --allow-hot-fee-claimer if you mean it.`
+      );
+    }
+    console.log(`  NOTE: ${role} is the signing hot wallet, allowed explicitly.`);
+  }
+}
+
 function configParameters(
   feeClaimer: PublicKey,
   tier: TierId,
@@ -287,6 +343,7 @@ async function main() {
         `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)\n` +
         `  --quote  <${Object.keys(QUOTES).join("|")}>  (or --quote-mint <ADDRESS>)\n` +
         `  --threshold <QUOTE TOKENS>  graduation point; keep it unreachable (default 100000)\n` +
+        `  --fee-claimer <ADDRESS>  platform fee destination (permanent; default the Ledger)\n` +
         `  --ledger [--ledger-path "44'/501'/0'/0'"] [--expect <ADDRESS>]`
     );
   }
@@ -310,7 +367,11 @@ async function main() {
   const client = DynamicBondingCurveClient.create(connection, "confirmed");
 
   if (cmd === "config") {
-    const feeClaimer = new PublicKey(arg("fee-claimer", wallet.publicKey.toBase58()));
+    // Defaults to the Ledger, NOT to whatever signed this. Defaulting to the
+    // signer is how platform fees end up permanently assigned to a throwaway
+    // hot key.
+    const feeClaimer = new PublicKey(arg("fee-claimer", PLATFORM_FEE_CLAIMER.toBase58()));
+    await assertClaimable(connection, feeClaimer, signer, "fee claimer");
     const tier = arg("tier", "1") as TierId;
     if (!(tier in FEE_TIERS)) {
       throw new Error(`unknown --tier '${tier}'. choose ${Object.keys(FEE_TIERS).join(", ")}`);
@@ -384,7 +445,13 @@ async function main() {
     console.log(`  endpoint       ${endpoint}`);
     console.log(`  payer          ${wallet.publicKey.toBase58()}`);
     console.log(`  config         ${config.publicKey.toBase58()}`);
-    console.log(`  fee claimer    ${feeClaimer.toBase58()}  <-- receives the trading fee`);
+    console.log(`  fee claimer    ${feeClaimer.toBase58()}  <-- receives the platform fee`);
+    console.log(`                 PERMANENT: no instruction can change this later.`);
+    console.log(`                 ${
+      feeClaimer.equals(signer.publicKey)
+        ? "This is the signer, so you can claim with the same key."
+        : "Claiming needs THIS key to sign, not the key creating the config."
+    }`);
     console.log(`  quote mint     ${quoteLabel}${isToken2022Quote ? " (Token-2022)" : ""}`);
     console.log(`  quote decimals ${quote.decimals}`);
     if (quoteBadge) console.log(`  quote badge    ${quoteBadge.toBase58()}`);
@@ -523,7 +590,8 @@ async function main() {
   // The pool creator owns the creator share of trading fees FOREVER. The
   // signer here is a throwaway hot wallet, so defaulting this to the signer
   // would quietly send that share to a key you intend to discard.
-  const creator = new PublicKey(arg("creator", wallet.publicKey.toBase58()));
+  const creator = new PublicKey(arg("creator", PLATFORM_FEE_CLAIMER.toBase58()));
+  await assertClaimable(connection, creator, signer, "pool creator");
   const baseMint = Keypair.generate();
   // Read the quote mint off the config rather than assuming SOL: the pool
   // address is derived from it, and a wrong guess derives a different pool.
