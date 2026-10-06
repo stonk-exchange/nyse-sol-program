@@ -42,8 +42,19 @@ const DAMM2 = new PublicKey("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG");
 const HOOK = new PublicKey("CUvtmRQZ6zikB7VijWzqS78orxrrkQhYkbhDL4PaPD6k");
 
 /** Exact UTC epochs for the stated Eastern wall-clock times. */
-const OPEN = 1_790_607_600n;      // Mon 2026-09-28 11:00 ET
-const SATURDAY = 1_791_039_600n;  // Sat 2026-10-03 11:00 ET
+// Defaults suit NYSE. Any market can be exercised by passing its own epochs:
+//   --open-ts <SECONDS>    a moment the schedule should ALLOW
+//   --closed-ts <SECONDS>  a moment it should BLOCK
+// Useful for proving a schedule is really the one it claims: 2026-09-28 12:00
+// ET is inside NYSE hours but past the London close, so an LSE token must
+// block there while an NYSE token trades.
+const OPEN = BigInt(argOr("open-ts", "1790607600"));      // Mon 2026-09-28 11:00 ET
+const SATURDAY = BigInt(argOr("closed-ts", "1791039600")); // Sat 2026-10-03 11:00 ET
+
+function argOr(n: string, d: string): string {
+  const i = process.argv.indexOf(`--${n}`);
+  return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : d;
+}
 
 function arg(n: string, d?: string): string {
   const i = process.argv.indexOf(`--${n}`);
@@ -174,7 +185,7 @@ function arg(n: string, d?: string): string {
       swapMode: SwapMode.ExactIn, amountIn: new BN(lamports.toString()), minimumAmountOut: new BN(0),
     } as any);
 
-  console.log("MARKET OPEN (Mon 11:00 ET)");
+  console.log(`MARKET SHOULD BE OPEN (ts ${OPEN})`);
   setClock(OPEN);
   const BUY = BigInt(qUnit) / 2n; // half a quote token
   let tx = await swap(BUY, false); await clone(tx);
@@ -220,7 +231,7 @@ function arg(n: string, d?: string): string {
     console.log("  (this config has a 0% creator share, nothing to claim)");
   }
 
-  console.log("\nMARKET CLOSED (Sat 11:00 ET)");
+  console.log(`\nMARKET SHOULD BE CLOSED (ts ${SATURDAY})`);
   setClock(SATURDAY);
   tx = await swap(BigInt(qUnit) / 10n, false); await clone(tx);
   run(tx, [], "buy (must fail)");

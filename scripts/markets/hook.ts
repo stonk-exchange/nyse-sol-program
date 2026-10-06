@@ -110,6 +110,20 @@ export function initializeRegistryIx(payer: PublicKey, authority: PublicKey): Tr
 }
 
 /** Approve a market, so future tokens may launch with it. */
+/**
+ * The schedule hashes compiled into ALLOWED_SCHEDULES in lib.rs.
+ *
+ * The program accepts a schedule that is EITHER in this list OR approved in
+ * the registry. Keeping a copy here lets the launcher refuse an unapproved
+ * market before it spends anything, rather than creating the pool and only
+ * then failing on the schedule write.
+ *
+ * Regenerate with: npx tsx scripts/hash-markets.ts
+ */
+export const COMPILED_SCHEDULE_HASHES = [
+  "29b1693654fb0ce8ffca994ddb1e57b6f5bbc0cb6b312845ebfadb0c8e9aed41", // NYSE
+];
+
 export function registerMarketIx(
   payer: PublicKey,
   authority: PublicKey,

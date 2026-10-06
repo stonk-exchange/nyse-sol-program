@@ -248,13 +248,37 @@ step "2/6  verify the buffer against the local build"
 # header and the rest must be the bytes we built.
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-solana account "$BUFFER" --url "$CLUSTER" --output json 2>/dev/null \
-  | python3 -c '
+solana account "$BUFFER" --url "$CLUSTER" --output json 2>/dev/null > "$TMP/acct.json" \
+  || die "could not read the buffer account"
+
+python3 -c '
+import base64, json, sys, base58
+' 2>/dev/null || true
+
+# Pull the payload and the current authority out of the same read. The
+# authority has to come from the account itself: "solana program show
+# --buffers" only lists buffers belonging to the querying key, so once
+# authority has moved to the Ledger the hot wallet can no longer see it, and a
+# resumed run would try to hand it over a second time and fail.
+python3 - "$TMP/acct.json" "$TMP/buffer.bin" "$TMP/buffer.auth" <<'PYEOF' || die "could not parse the buffer account"
 import base64, json, sys
-acct = json.load(sys.stdin)["account"]
+
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58encode(b):
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = B58[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\0"))) + out
+
+acct = json.load(open(sys.argv[1]))["account"]
 raw = base64.b64decode(acct["data"][0])
-sys.stdout.buffer.write(raw[37:])
-' > "$TMP/buffer.bin" || die "could not read the buffer account"
+# UpgradeableLoaderState::Buffer -- 4-byte enum tag, 1-byte Option tag,
+# 32-byte authority, then the ELF.
+open(sys.argv[2], "wb").write(raw[37:])
+open(sys.argv[3], "w").write(b58encode(raw[5:37]) if raw[4] == 1 else "none")
+PYEOF
 
 head -c "$SO_SIZE" "$TMP/buffer.bin" > "$TMP/buffer.so"
 BUF_HASH="$(shasum -a 256 "$TMP/buffer.so" | awk '{print $1}')"
@@ -271,8 +295,8 @@ say "matches the local build."
 
 step "3/6  transfer buffer authority to the Ledger"
 
-CUR_BUF_AUTH="$(solana program show --buffers "${PAYER_ARGS[@]+"${PAYER_ARGS[@]}"}" --url "$CLUSTER" 2>/dev/null \
-  | awk -v b="$BUFFER" '$1 == b {print $3}')"
+CUR_BUF_AUTH="$(cat "$TMP/buffer.auth")"
+say "current authority   $CUR_BUF_AUTH"
 if [ "$CUR_BUF_AUTH" = "$LEDGER_ADDR" ]; then
   say "already set to $LEDGER_ADDR"
 else

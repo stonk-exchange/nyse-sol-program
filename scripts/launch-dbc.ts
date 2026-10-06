@@ -29,10 +29,11 @@ import {
   TransactionInstruction, clusterApiUrl, sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import { NATIVE_MINT, getMint, TOKEN_2022_PROGRAM_ID, getExtensionTypes } from "@solana/spl-token";
-import { market, MARKETS } from "./markets/presets";
+import { market, MARKETS, Market } from "./markets/presets";
 import { QUOTES, resolveQuote } from "./markets/quotes";
 import {
   initializeScheduleIx, extraAccountMetasAddress, initializeRegistryIx, registryAddress,
+  registerMarketIx, marketAddress, scheduleHash, COMPILED_SCHEDULE_HASHES,
 } from "./markets/hook";
 import { openLedger, sendWithLedger, DEFAULT_LEDGER_PATH, LedgerSigner } from "./markets/ledger";
 import {
@@ -307,6 +308,29 @@ async function assertClaimable(
   }
 }
 
+/**
+ * The market a command should act on.
+ *
+ * --market names a compiled-in preset; --market-file takes a JSON schedule,
+ * which is how a calendar added after launch is used. A file-sourced market
+ * only works if it has been registered (see the register-market command),
+ * because the program rejects any schedule that is neither compiled in nor
+ * present in the registry.
+ */
+function chosenMarket(): Market {
+  const i = process.argv.indexOf("--market-file");
+  if (i !== -1 && process.argv[i + 1]) {
+    const path = process.argv[i + 1];
+    const m = JSON.parse(fs.readFileSync(path, "utf8")) as Market;
+    for (const k of ["id", "label", "tzOffsetMinutes", "dstRule", "baseDay", "windows"]) {
+      if ((m as any)[k] === undefined) throw new Error(`${path} is missing '${k}'`);
+    }
+    m.holidays ??= []; m.earlyCloses ??= []; m.events ??= [];
+    return m;
+  }
+  return market(arg("market", "nyse"));
+}
+
 function configParameters(
   feeClaimer: PublicKey,
   tier: TierId,
@@ -337,10 +361,10 @@ function configParameters(
 
 async function main() {
   const cmd = process.argv[2];
-  if (!["config", "token", "claim", "registry"].includes(cmd)) {
+  if (!["config", "token", "claim", "registry", "register-market"].includes(cmd)) {
     throw new Error(
-      `usage: launch-dbc.ts <config|token|claim|registry> [...]\n` +
-        `  --market <${Object.keys(MARKETS).join("|")}>\n` +
+      `usage: launch-dbc.ts <config|token|claim|registry|register-market> [...]\n` +
+        `  --market <${Object.keys(MARKETS).join("|")}>  (or --market-file <schedule.json>)\n` +
         `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)\n` +
         `  --quote  <${Object.keys(QUOTES).join("|")}>  (or --quote-mint <ADDRESS>)\n` +
         `  --threshold <QUOTE TOKENS>  graduation point; keep it unreachable (default 100000)\n` +
@@ -583,6 +607,50 @@ async function main() {
     return;
   }
 
+  if (cmd === "register-market") {
+    // Approve a calendar so tokens may launch with it. This is what makes the
+    // burned upgrade authority survivable: a market is data, so adding one
+    // needs no new program and no new hook address.
+    const m = chosenMarket();
+    const hash = scheduleHash(m);
+    const registry = registryAddress();
+    const reg = await connection.getAccountInfo(registry);
+    if (!reg) throw new Error(`no registry at ${registry.toBase58()} -- run the 'registry' command first`);
+    const onChainAuthority = new PublicKey(reg.data.subarray(8, 40));
+    const market_ = marketAddress(hash);
+
+    console.log("approve a market");
+    console.log(`  endpoint   ${endpoint}`);
+    console.log(`  market     ${m.label} (${m.id})`);
+    console.log(`  hash       ${hash.toString("hex")}`);
+    console.log(`  market PDA ${market_.toBase58()}`);
+    console.log(`  registry   ${registry.toBase58()}`);
+    console.log(`  authority  ${onChainAuthority.toBase58()}`);
+    console.log(`  signer     ${signer.publicKey.toBase58()}${signer.isLedger ? " (Ledger)" : ""}`);
+
+    if (!onChainAuthority.equals(signer.publicKey)) {
+      throw new Error(
+        `the registry authority is ${onChainAuthority.toBase58()}, but this is signing as ` +
+          `${signer.publicKey.toBase58()}.\n  Only the authority may approve a market.`
+      );
+    }
+    if (await connection.getAccountInfo(market_)) {
+      console.log("\nAlready approved. Nothing to do.");
+      return;
+    }
+    console.log(`\n  Approving affects only FUTURE launches. A token copies its`);
+    console.log(`  schedule at launch, so nothing here can reach one already live.`);
+    if (!execute) { console.log("\nDry run. Add --execute to send."); return; }
+
+    const sig = await signer.send(
+      connection,
+      new Transaction().add(registerMarketIx(wallet.publicKey, signer.publicKey, m))
+    );
+    console.log("\nmarket approved:", sig);
+    console.log("tokens may now launch with --market-file for this schedule.");
+    return;
+  }
+
   // cmd === "token"
   const config = new PublicKey(arg("config"));
   const name = arg("name");
@@ -590,8 +658,7 @@ async function main() {
   const uri = arg("uri");
   // Which market this token trades on. A market is data, so new ones need no
   // program upgrade; the choice is fixed for the life of the token.
-  const marketId = arg("market", "nyse");
-  const chosen = market(marketId);
+  const chosen = chosenMarket();
   // The pool creator owns the creator share of trading fees FOREVER. The
   // signer here is a throwaway hot wallet, so defaulting this to the signer
   // would quietly send that share to a key you intend to discard.
@@ -631,7 +698,32 @@ async function main() {
   console.log(`  pool           ${pool.toBase58()}`);
   console.log(`  name / symbol  ${name} / ${symbol}`);
   console.log(`  uri            ${uri}`);
-  console.log(`  market         ${chosen.label}`);
+  // A market approved through the registry needs its Market account passed;
+  // one compiled into the program does not. Decide by looking rather than by
+  // assuming, so a preset that is only registered still works.
+  const chosenHash = scheduleHash(chosen);
+  const marketPda = marketAddress(chosenHash);
+  const viaRegistry = (await connection.getAccountInfo(marketPda)) !== null;
+  const compiledIn = COMPILED_SCHEDULE_HASHES.includes(chosenHash.toString("hex"));
+  // Check this BEFORE the pool is created. The schedule is written in a second
+  // transaction, so an unapproved market would otherwise mint the token, pay
+  // for the pool, and only then fail -- leaving a mint that can never trade.
+  if (!viaRegistry && !compiledIn) {
+    throw new Error(
+      `'${chosen.label}' is not an approved market.\n` +
+        `  hash ${chosenHash.toString("hex")}\n` +
+        `  It is neither compiled into the program nor in the registry, so the\n` +
+        `  schedule write would fail AFTER the pool was paid for. Approve it first:\n` +
+        `    npx tsx scripts/launch-dbc.ts register-market --market-file <file> --ledger --execute`
+    );
+  }
+  // Not knowing ALLOWED_SCHEDULES here, the honest distinction is whether the
+  // registry approves it -- a schedule that is neither registered nor compiled
+  // in is rejected on chain with UnapprovedMarket (6013).
+  console.log(
+    `  market         ${chosen.label}` +
+      (viaRegistry ? "  [approved via registry]" : "  [compiled into the program]")
+  );
   console.log(`  transfer hook  ${HOOK_PROGRAM_ID.toBase58()}`);
   console.log(`  pool creator   ${creator.toBase58()}  <-- owns the creator fee share`);
   if (creator.equals(wallet.publicKey)) {
@@ -665,7 +757,9 @@ async function main() {
   // Must happen before anyone can trade.
   const initSig = await signer.send(
     connection,
-    new Transaction().add(initializeScheduleIx(baseMint.publicKey, wallet.publicKey, chosen))
+    new Transaction().add(
+      initializeScheduleIx(baseMint.publicKey, wallet.publicKey, chosen, viaRegistry)
+    )
   );
   console.log("schedule + hook state written:", initSig);
 
