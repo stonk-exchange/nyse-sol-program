@@ -28,8 +28,9 @@ import {
   Connection, Keypair, PublicKey, SystemProgram, Transaction,
   TransactionInstruction, clusterApiUrl, sendAndConfirmTransaction,
 } from "@solana/web3.js";
-import { NATIVE_MINT } from "@solana/spl-token";
+import { NATIVE_MINT, getMint, TOKEN_2022_PROGRAM_ID, getExtensionTypes } from "@solana/spl-token";
 import { market, MARKETS } from "./markets/presets";
+import { QUOTES, resolveQuote } from "./markets/quotes";
 import {
   initializeScheduleIx, extraAccountMetasAddress, initializeRegistryIx, registryAddress,
 } from "./markets/hook";
@@ -37,6 +38,8 @@ import { openLedger, sendWithLedger, DEFAULT_LEDGER_PATH, LedgerSigner } from ".
 import {
   DynamicBondingCurveClient,
   deriveDbcPoolAddress,
+  deriveTokenBadgeAddress,
+  buildCurve as buildCurveFromThreshold,
   DEFAULT_MIGRATED_POOL_MARKET_CAP_FEE_SCHEDULER_PARAMS,
 } from "@meteora-ag/dynamic-bonding-curve-sdk";
 
@@ -103,20 +106,98 @@ function tierSplit(t: { cliffFeeNumerator: number; creatorSharePct: number }) {
   };
 }
 
-const CURVE = {
-  sqrtStartPrice: new BN("101036978416954620"),
-  migrationQuoteThreshold: new BN("100000000000000"), // 100,000 SOL
-  points: [
-    {
-      sqrtPrice: new BN("449154274387104154620"),
-      liquidity: new BN("75777733812715966441353696383589"),
+const SUPPLY = 1_000_000_000; // whole tokens
+const BASE_DECIMALS = 6;
+
+/**
+ * Build the curve for a given quote mint.
+ *
+ * sqrtStartPrice, the curve points and the migration threshold are all
+ * denominated in the QUOTE token, so they cannot be shared between a 9-decimal
+ * SOL pool and an 8-decimal stock token. The SDK derives a consistent set from
+ * market caps; DBC rejects a config whose curve and threshold disagree.
+ *
+ * The migration cap is the lever that decides whether the hours are permanent.
+ * DBC strips the transfer hook when a curve completes, so a reachable cap means
+ * the trading-hours restriction ends. Default it absurdly high.
+ */
+/** Meteora fee numerators are out of 1e9; bps are out of 1e4. */
+function feeBps(cliffFeeNumerator: number): number {
+  const bps = cliffFeeNumerator / 100_000;
+  if (!Number.isInteger(bps)) throw new Error(`fee numerator ${cliffFeeNumerator} is not a whole number of bps`);
+  return bps;
+}
+
+function buildCurveConfig(opts: {
+  quoteDecimals: number;
+  /** Quote tokens that must flow in before the curve completes. */
+  migrationThreshold: number;
+  /** Share of supply handed to the migrated pool; the rest sells on the curve. */
+  supplyOnMigrationPct: number;
+  cliffFeeNumerator: number;
+  creatorSharePct: number;
+}) {
+  return buildCurveFromThreshold({
+    token: {
+      tokenType: 1, // Token-2022, required for a transfer hook
+      tokenBaseDecimal: BASE_DECIMALS,
+      tokenQuoteDecimal: opts.quoteDecimals,
+      tokenAuthorityOption: 1, // Immutable
+      totalTokenSupply: SUPPLY,
+      leftover: 0,
     },
-  ],
-  tokenSupply: new BN("1000000000000000"), // 1e15 base units = 1B at 6 decimals
-  tokenDecimal: 6,
-  migrationFeePercentage: 0,
-  migratedPoolFeeBps: 0,
-};
+    // The builder takes the fee in BPS and validates it; configParameters()
+    // later overwrites poolFees with the raw on-chain shape. A flat fee is a
+    // linear schedule with start == end and no periods.
+    fee: {
+      baseFeeParams: {
+        baseFeeMode: 0, // FeeSchedulerLinear
+        feeSchedulerParam: {
+          startingFeeBps: feeBps(opts.cliffFeeNumerator),
+          endingFeeBps: feeBps(opts.cliffFeeNumerator),
+          numberOfPeriod: 0,
+          totalDuration: 0,
+        },
+      },
+      dynamicFeeEnabled: false,
+      collectFeeMode: 0, // QuoteToken
+      creatorTradingFeePercentage: opts.creatorSharePct,
+      poolCreationFee: 0,
+      enableFirstSwapWithMinFee: false,
+    },
+    migration: {
+      migrationOption: 1, // DAMM v2
+      migrationFeeOption: 2, // FixedBps100
+      migrationFee: { feePercentage: 0, creatorFeePercentage: 0 },
+      migratedPoolFee: { collectFeeMode: 0, dynamicFee: 0, poolFeeBps: 0 },
+    },
+    liquidityDistribution: {
+      partnerLockedLpPercentage: 50,
+      partnerLpPercentage: 0,
+      creatorLockedLpPercentage: 50,
+      creatorLpPercentage: 0,
+    },
+    // No vesting. These are the builder's HIGH-LEVEL inputs, not the
+    // already-computed on-chain shape: it derives amountPerPeriod itself and
+    // short-circuits cleanly only when totalLockedVestingAmount is 0.
+    lockedVesting: {
+      totalLockedVestingAmount: 0,
+      numberOfVestingPeriod: 0,
+      cliffUnlockAmount: 0,
+      totalVestingDuration: 0,
+      cliffDurationFromMigrationTime: 0,
+    },
+    activationType: 1, // timestamp
+    // Deliberately NOT buildCurveWithMarketCap: deriving the threshold from a
+    // pair of market caps leaves a rounding residual that makes it throw
+    // "Not enough liquidity" for many perfectly sensible cap pairs, and the
+    // threshold -- not the cap -- is the number that decides whether the
+    // trading hours are permanent. Naming it directly is exact at both the
+    // 9-decimal (SOL) and 8-decimal (xStock) scales.
+    percentageSupplyOnMigration: opts.supplyOnMigrationPct,
+    migrationQuoteThreshold: opts.migrationThreshold,
+  } as any);
+}
 
 function arg(name: string, fallback?: string): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -164,9 +245,14 @@ function loadWallet(): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(path, "utf8"))));
 }
 
-function configParameters(feeClaimer: PublicKey, tier: TierId) {
+function configParameters(
+  feeClaimer: PublicKey,
+  tier: TierId,
+  curve: any
+) {
   const t = FEE_TIERS[tier];
   return {
+    ...curve,
     poolFees: {
       baseFee: {
         cliffFeeNumerator: new BN(t.cliffFeeNumerator),
@@ -177,49 +263,13 @@ function configParameters(feeClaimer: PublicKey, tier: TierId) {
       },
       dynamicFee: null,
     },
-    collectFeeMode: 0,
-    migrationOption: 1, // DAMM v2
-    activationType: 1, // timestamp
-    tokenType: 1, // Token-2022, required for a transfer hook
-    tokenDecimal: CURVE.tokenDecimal,
-    partnerLiquidityPercentage: 0,
-    partnerPermanentLockedLiquidityPercentage: 50,
-    creatorLiquidityPercentage: 0,
-    creatorPermanentLockedLiquidityPercentage: 50,
-    migrationQuoteThreshold: CURVE.migrationQuoteThreshold,
-    sqrtStartPrice: CURVE.sqrtStartPrice,
-    lockedVesting: {
-      amountPerPeriod: new BN(0),
-      cliffDurationFromMigrationTime: new BN(0),
-      frequency: new BN(0),
-      numberOfPeriod: new BN(0),
-      cliffUnlockAmount: new BN(0),
-    },
-    migrationFeeOption: 2, // FixedBps100
-    tokenSupply: {
-      preMigrationTokenSupply: CURVE.tokenSupply,
-      postMigrationTokenSupply: CURVE.tokenSupply,
-    },
     creatorTradingFeePercentage: t.creatorSharePct,
     tokenUpdateAuthority: 1, // Immutable: name, symbol and uri can never change
-    migrationFee: {
-      feePercentage: CURVE.migrationFeePercentage,
-      creatorFeePercentage: 0,
-    },
-    migratedPoolFee: {
-      collectFeeMode: 0,
-      dynamicFee: 0,
-      poolFeeBps: CURVE.migratedPoolFeeBps,
-    },
-    poolCreationFee: new BN(0),
-    // These are required rather than nullable; the all-zero defaults mean
-    // "no vesting" and "no market-cap fee scheduler", matching the live config.
     partnerLiquidityVestingInfo: NO_LIQUIDITY_VESTING,
     creatorLiquidityVestingInfo: NO_LIQUIDITY_VESTING,
     migratedPoolBaseFeeMode: 0,
     migratedPoolMarketCapFeeSchedulerParams:
       DEFAULT_MIGRATED_POOL_MARKET_CAP_FEE_SCHEDULER_PARAMS,
-    curve: CURVE.points,
   } as any;
 }
 
@@ -230,6 +280,8 @@ async function main() {
       `usage: launch-dbc.ts <config|token|claim|registry> [...]\n` +
         `  --market <${Object.keys(MARKETS).join("|")}>\n` +
         `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)\n` +
+        `  --quote  <${Object.keys(QUOTES).join("|")}>  (or --quote-mint <ADDRESS>)\n` +
+        `  --threshold <QUOTE TOKENS>  graduation point; keep it unreachable (default 100000)\n` +
         `  --ledger [--ledger-path "44'/501'/0'/0'"] [--expect <ADDRESS>]`
     );
   }
@@ -261,22 +313,76 @@ async function main() {
     const split = tierSplit(FEE_TIERS[tier]);
     const config = Keypair.generate();
 
+    // Pair against SOL by default, or any quote mint DBC accepts -- a tokenised
+    // stock, for instance. Its decimals feed the curve, so they must be read
+    // from chain rather than assumed.
+    // --quote takes a symbol from the pair list (SOL, QQQx, TSLAx, ...);
+    // --quote-mint takes a raw address for anything not in it.
+    const quoteSpec = arg("quote-mint", "") || arg("quote", "SOL");
+    const resolved = resolveQuote(quoteSpec);
+    const quoteMint = new PublicKey(resolved.mint);
+    const quoteInfo = await connection.getAccountInfo(quoteMint);
+    if (!quoteInfo) throw new Error(`quote mint ${quoteMint.toBase58()} not found on ${cluster}`);
+    const isToken2022Quote = quoteInfo.owner.equals(TOKEN_2022_PROGRAM_ID);
+    const quote = await getMint(connection, quoteMint, "confirmed", quoteInfo.owner);
+    const quoteLabel = resolved.symbol;
+    // A preset that has drifted from the chain would silently build the curve
+    // at the wrong scale, so the presets are checked rather than trusted.
+    if (resolved.decimals !== undefined && resolved.decimals !== quote.decimals) {
+      throw new Error(
+        `${quoteLabel} preset says ${resolved.decimals} decimals but the mint has ${quote.decimals}. ` +
+          `Re-run scripts/check-quotes.ts.`
+      );
+    }
+
+    // A Token-2022 quote mint with extensions is not permissionless on DBC and
+    // needs a quote-mint token badge, passed as a remaining account.
+    let quoteBadge: PublicKey | undefined;
+    if (isToken2022Quote) {
+      const badge = deriveTokenBadgeAddress(quoteMint);
+      const exists = await connection.getAccountInfo(badge);
+      if (!exists) {
+        throw new Error(
+          `${quoteLabel} has no DBC quote-mint token badge (${badge.toBase58()}).\n` +
+            "  Meteora has to issue one before it can be used as a quote mint."
+        );
+      }
+      quoteBadge = badge;
+    }
+
+    const migrationThreshold = Number(arg("threshold", "100000"));
+    const supplyOnMigrationPct = Number(arg("supply-on-migration", "20"));
+    const curve = buildCurveConfig({
+      quoteDecimals: quote.decimals,
+      migrationThreshold,
+      supplyOnMigrationPct,
+      cliffFeeNumerator: FEE_TIERS[tier].cliffFeeNumerator,
+      creatorSharePct: FEE_TIERS[tier].creatorSharePct,
+    });
+    const threshold = Number(curve.migrationQuoteThreshold) / 10 ** quote.decimals;
+    if (threshold !== migrationThreshold) {
+      throw new Error(`asked for a ${migrationThreshold} threshold, curve encodes ${threshold}`);
+    }
+
     console.log("Create DBC partner config");
     console.log(`  endpoint       ${endpoint}`);
     console.log(`  payer          ${wallet.publicKey.toBase58()}`);
     console.log(`  config         ${config.publicKey.toBase58()}`);
     console.log(`  fee claimer    ${feeClaimer.toBase58()}  <-- receives the trading fee`);
-    console.log(`  quote mint     SOL`);
+    console.log(`  quote mint     ${quoteLabel}${isToken2022Quote ? " (Token-2022)" : ""}`);
+    console.log(`  quote decimals ${quote.decimals}`);
+    if (quoteBadge) console.log(`  quote badge    ${quoteBadge.toBase58()}`);
     console.log(`  transfer hook  ${HOOK_PROGRAM_ID.toBase58()}`);
     console.log(`  fee tier       ${tier}% creator`);
     console.log(`  trading fee    ${split.total.toFixed(2)}% of every buy and sell`);
     console.log(`    creator gets ${split.creator.toFixed(3)}%`);
     console.log(`    you get      ${split.platform.toFixed(3)}%`);
     console.log(`    Meteora gets ${(split.total * 0.2).toFixed(3)}% (20% protocol fee)`);
-    console.log(`  graduates at   ${(Number(CURVE.migrationQuoteThreshold) / 1e9).toLocaleString()} SOL  <-- deliberately out of reach`);
-    console.log(`                 DBC revokes the hook when a curve completes, so a`);
-    console.log(`                 reachable threshold would end the trading hours.`);
-    console.log(`  supply         1,000,000,000 at ${CURVE.tokenDecimal} decimals`);
+    console.log(`  supply on migration ${supplyOnMigrationPct}% (the rest sells on the curve)`);
+    console.log(`  graduates at   ${threshold.toLocaleString()} ${quoteLabel}`);
+    console.log(`                 DBC strips the hook when a curve completes, which would`);
+    console.log(`                 end the trading hours. Keep this out of reach.`);
+    console.log(`  supply         ${SUPPLY.toLocaleString()} at ${BASE_DECIMALS} decimals`);
 
     if (!execute) { console.log("\nDry run. Add --execute to send."); return; }
 
@@ -284,24 +390,28 @@ async function main() {
     if (!hook?.executable) throw new Error(`hook program is not deployed on ${cluster}`);
 
     const tx = await client.partner.createConfigWithTransferHook({
-      ...configParameters(feeClaimer, tier),
+      ...configParameters(feeClaimer, tier, curve),
       config: config.publicKey,
       feeClaimer,
       leftoverReceiver: feeClaimer,
       payer: wallet.publicKey,
-      quoteMint: NATIVE_MINT,
+      quoteMint,
       transferHookProgram: HOOK_PROGRAM_ID,
+      ...(quoteBadge ? { tokenBadge: quoteBadge } : {}),
     });
     const sig = await signer.send(connection, tx, [config]);
     console.log("\nconfig created:", sig);
     console.log("config address:", config.publicKey.toBase58());
-    fs.writeFileSync(`dbc-config-${cluster}-${tier}.json`, JSON.stringify({
+    const outName = `dbc-config-${cluster}-${quoteLabel}-${tier}.json`;
+    fs.writeFileSync(outName, JSON.stringify({
       cluster, tier, config: config.publicKey.toBase58(), feeClaimer: feeClaimer.toBase58(),
+      quoteMint: quoteMint.toBase58(), quoteDecimals: quote.decimals, quoteSymbol: quoteLabel,
+      migrationThreshold: threshold,
       transferHookProgram: HOOK_PROGRAM_ID.toBase58(),
       totalFeePct: split.total, creatorPct: split.creator, platformPct: split.platform,
       createdAt: new Date().toISOString(),
     }, null, 2) + "\n");
-    console.log(`wrote dbc-config-${cluster}-${tier}.json -- reuse for every token on this tier`);
+    console.log(`wrote ${outName} -- reuse for every token on this tier and quote`);
     return;
   }
 
@@ -346,16 +456,28 @@ async function main() {
     const state = await client.state.getPool(pool);
     if (!state) throw new Error(`no DBC pool at ${pool.toBase58()}`);
     const ps: any = (state as any).poolState ?? state;
-    const quote = as === "creator" ? ps.creatorQuoteFee : ps.partnerQuoteFee;
+    const quoteFee = as === "creator" ? ps.creatorQuoteFee : ps.partnerQuoteFee;
     const base = as === "creator" ? ps.creatorBaseFee : ps.partnerBaseFee;
+
+    // Fees accrue in the QUOTE token, which is only SOL when the pool was
+    // configured that way. Read the mint off the pool's config rather than
+    // assuming 9 decimals -- an xStock quote has 8, and the claim would be
+    // reported ten times too small under the wrong label.
+    const poolCfg: any = await client.state.getPoolConfig(ps.config);
+    const quoteMint: PublicKey = (poolCfg.configState ?? poolCfg).quoteMint;
+    const known = Object.values(QUOTES).find((q) => q.mint === quoteMint.toBase58());
+    const quoteInfo = await connection.getAccountInfo(quoteMint);
+    const quoteDecimals = (await getMint(connection, quoteMint, "confirmed", quoteInfo!.owner)).decimals;
+    const quoteLabel = known?.symbol ?? quoteMint.toBase58();
 
     console.log(`claim ${as} fees`);
     console.log(`  pool       ${pool.toBase58()}`);
     console.log(`  claimer    ${wallet.publicKey.toBase58()}`);
     console.log(`  receiver   ${receiver.toBase58()}`);
-    console.log(`  claimable  ${(Number(quote) / 1e9).toFixed(6)} SOL + ${base} base units`);
+    console.log(`  quote      ${quoteLabel} (${quoteDecimals} decimals)`);
+    console.log(`  claimable  ${(Number(quoteFee) / 10 ** quoteDecimals).toFixed(quoteDecimals)} ${quoteLabel} + ${base} base units`);
 
-    if (Number(quote) === 0 && Number(base) === 0) {
+    if (Number(quoteFee) === 0 && Number(base) === 0) {
       console.log("\nNothing to claim.");
       return;
     }
@@ -363,7 +485,7 @@ async function main() {
 
     const params = {
       payer: wallet.publicKey, pool, receiver,
-      maxBaseAmount: base, maxQuoteAmount: quote,
+      maxBaseAmount: base, maxQuoteAmount: quoteFee,
     };
     const tx =
       as === "creator"
@@ -387,11 +509,19 @@ async function main() {
   // would quietly send that share to a key you intend to discard.
   const creator = new PublicKey(arg("creator", wallet.publicKey.toBase58()));
   const baseMint = Keypair.generate();
-  const pool = deriveDbcPoolAddress(NATIVE_MINT, baseMint.publicKey, config);
+  // Read the quote mint off the config rather than assuming SOL: the pool
+  // address is derived from it, and a wrong guess derives a different pool.
+  const cfgState = await client.state.getPoolConfig(config);
+  if (!cfgState) throw new Error(`no DBC config at ${config.toBase58()}`);
+  const cfgQuote = ((cfgState as any).configState ?? cfgState).quoteMint as PublicKey;
+  const pool = deriveDbcPoolAddress(cfgQuote, baseMint.publicKey, config);
 
   console.log("Launch token on your DBC config");
   console.log(`  endpoint       ${endpoint}`);
   console.log(`  config         ${config.toBase58()}`);
+  const cfgQuoteLabel =
+    Object.values(QUOTES).find((q) => q.mint === cfgQuote.toBase58())?.symbol ?? cfgQuote.toBase58();
+  console.log(`  quote mint     ${cfgQuoteLabel}`);
   console.log(`  base mint      ${baseMint.publicKey.toBase58()}`);
   console.log(`  pool           ${pool.toBase58()}`);
   console.log(`  name / symbol  ${name} / ${symbol}`);
