@@ -54,7 +54,19 @@ reach.
 | config | quote | tier | opening FDV | threshold | status |
 | --- | --- | --- | --- | --- | --- |
 | `77aqJUCTs6anDL9ypRT6zDh6Y9o8zKQ5ALvXb1JF2SAR` | SOL | 1% creator | 30 SOL | 100,000 SOL | **current** |
+| `3mnEyRQ5JSa6EQNffSrKTC9TpaCri1zKm7BY7tGCw6g3` | USDC | 1% creator | 3,500 USDC | 12,000,000 USDC | **current** |
 | `Dh7vBs5PoqqmyduMfEy6bS8K2Z4o8t59jLcpZQUToCSf` | SOL | 1% creator | 31,250 SOL | 100,000 SOL | superseded — see below |
+
+The USDC config matches the SOL one's economics at the SOL price when it was
+created ($116.91): 30 SOL is about $3,500, and 100,000 SOL about $11.7m, so the
+threshold was set at $12m. It is arguably the sturdier of the two, because a
+threshold denominated in USDC does not move with the SOL price — 100,000 SOL
+would be roughly $6m if SOL halved.
+
+There is no instruction anywhere in DBC that can change a config, and a pool
+reads its config's threshold rather than storing its own, so a launched token's
+graduation point is fixed for good. Raising it for future tokens means a new
+config, which is cheap; existing tokens keep theirs.
 
 Both have `feeClaimer` = `FTnprQrx…`, 250 bps total (1.00% creator, 1.00%
 platform, 0.50% Meteora), LP 50/0/50/0 all permanently locked.
@@ -66,16 +78,29 @@ copies its price curve from hours.fun's equivalent via `--curve-from`, giving
 the same 30 SOL open and the same 100,000 SOL threshold. A config's curve cannot
 be changed, so the fix was a new config.
 
-Reference curve source: `EzzRR1fmvQjkgCnTW7RiVDSBcmK2isEZZyQheBvDeGg9`.
+Reference curve source for the SOL config: `EzzRR1fmvQjkgCnTW7RiVDSBcmK2isEZZyQheBvDeGg9`.
+
+The USDC config needed no reference. `--open-fdv` solves the curve directly:
+`buildCurveWithCustomSqrtPrices` derives the threshold from the two prices, so
+the end price is bisected until the threshold lands where asked. No USDC
+reference existed to copy — of the 100 USDC-quoted hooked configs on mainnet,
+none match our token shape. Solving for 30 SOL and 100,000 SOL reproduces the
+hours.fun economics exactly, which is how the solver was checked.
+
+Fork-tested before deployment: config, lookup table and a single-transaction
+launch on a local chain, then buy and sell during hours, fees accruing and
+claiming in USDC, and a buy outside hours blocked with MarketClosed (6000).
 
 ### Launch lookup table
 
 | | |
 | --- | --- |
-| table | `DXS76SxHNj1GvP4nXBsjZ5sXq9x8Te4Zn9T7NPSkiMrm` |
-| for config | `77aqJUCTs6anDL9ypRT6zDh6Y9o8zKQ5ALvXb1JF2SAR` |
-| addresses | 9 |
-| authority | `2WE8bqGTXQVsv1w8BM3Htqg9MQmLKKcfKrQoWubbJLRf` (hot wallet) |
+| table | for config | addresses |
+| --- | --- | --- |
+| `DXS76SxHNj1GvP4nXBsjZ5sXq9x8Te4Zn9T7NPSkiMrm` | `77aqJUCTs…` (SOL) | 9 |
+| `6DuFvXr6ypGKuhkZ7szBmCuq6a62Jb6uk6ouFySnMwmh` | `3mnEyRQ5J…` (USDC) | 9 |
+
+Both have authority `2WE8bqGTXQVsv1w8BM3Htqg9MQmLKKcfKrQoWubbJLRf` (hot wallet).
 
 Without it a launch is two transactions, because the pool creation and the
 schedule write come to 1286 bytes together and the limit is 1232. That split

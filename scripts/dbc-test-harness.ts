@@ -140,12 +140,15 @@ function arg(n: string, d?: string): string {
   const quoteDecimals = (await t.getMint(c, quoteMint, "confirmed", quoteProgram)).decimals;
   const QUOTE_SYMBOLS: Record<string, string> = {
     So11111111111111111111111111111111111111112: "SOL",
+    EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "USDC",
+    Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: "USDT",
     Xs8S1uUs1zvS2p7iwtsG3b6fkhpvmwz4GYU3gWAmWHZ: "QQQx",
   };
   const qSym = QUOTE_SYMBOLS[quoteMint.toBase58()] ?? quoteMint.toBase58().slice(0, 8);
   const qUnit = 10 ** quoteDecimals;
   const fmtQ = (n: bigint | number) => (Number(n) / qUnit).toFixed(6) + " " + qSym;
-  console.log(`quote: ${qSym} (${quoteDecimals} decimals, ${isSol ? "SPL" : "Token-2022"})\n`);
+  const quoteProgLabel = quoteProgram.equals(t.TOKEN_2022_PROGRAM_ID) ? "Token-2022" : "SPL";
+  console.log(`quote: ${qSym} (${quoteDecimals} decimals, ${quoteProgLabel})\n`);
 
   for (const pk of [pool, mint, op.config, op.baseVault, op.quoteVault, ata, quoteMint]) await cloneOne(pk);
   if (!isSol) await cloneOne(deriveTokenBadgeAddress(quoteMint));
