@@ -24,6 +24,11 @@ export type Quote = {
 
 export const QUOTES: Record<string, Quote> = {
   SOL:    { symbol: "SOL",    name: "Wrapped SOL",          mint: "So11111111111111111111111111111111111111112", decimals: 9 },
+  // Stablecoins. Classic SPL, so no DBC token badge is needed, and 6 decimals
+  // rather than SOL's 9 -- every quote-denominated number in a curve is in base
+  // units, so a SOL curve cannot be reused for these.
+  USDC:   { symbol: "USDC",   name: "USD Coin",             mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", decimals: 6 },
+  USDT:   { symbol: "USDT",   name: "Tether USD",           mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 },
   SPYx:   { symbol: "SPYx",   name: "SP500 xStock",         mint: "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W",  decimals: 8 },
   QQQx:   { symbol: "QQQx",   name: "Nasdaq xStock",        mint: "Xs8S1uUs1zvS2p7iwtsG3b6fkhpvmwz4GYU3gWAmWHZ",  decimals: 8 },
   GLDx:   { symbol: "GLDx",   name: "Gold xStock",          mint: "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re",  decimals: 8 },
@@ -41,7 +46,12 @@ export const QUOTES: Record<string, Quote> = {
   PLTRx:  { symbol: "PLTRx",  name: "Palantir xStock",      mint: "XsoBhf2ufR8fTyNSjqfU71DYGaE6Z3SUGAidpzriAA4",  decimals: 8 },
 };
 
-/** Accepts a symbol from QUOTES or a raw mint address. */
+/**
+ * Accepts a symbol from QUOTES or a raw mint address.
+ *
+ * USDC has roughly twice USDT's supply on Solana and 100 hooked DBC configs to
+ * USDT's zero, so it is the stablecoin worth reaching for first.
+ */
 export function resolveQuote(spec: string): { mint: string; decimals?: number; symbol: string } {
   const bySymbol = QUOTES[spec] ?? Object.values(QUOTES).find((q) => q.symbol.toLowerCase() === spec.toLowerCase());
   if (bySymbol) return bySymbol;

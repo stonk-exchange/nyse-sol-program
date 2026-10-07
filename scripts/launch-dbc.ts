@@ -42,6 +42,7 @@ import {
   deriveDbcPoolAddress,
   deriveTokenBadgeAddress,
   buildCurve as buildCurveFromThreshold,
+  buildCurveWithCustomSqrtPrices,
   DEFAULT_MIGRATED_POOL_MARKET_CAP_FEE_SCHEDULER_PARAMS,
 } from "@meteora-ag/dynamic-bonding-curve-sdk";
 
@@ -144,20 +145,88 @@ function feeBps(cliffFeeNumerator: number): number {
   return bps;
 }
 
-function buildCurveConfig(opts: {
+const Q64 = 2 ** 64;
+
+/** The sqrt price (Q64.64) at which the whole supply is worth `fdv` quote tokens. */
+function sqrtPriceForFdv(fdv: number, quoteDecimals: number): BN {
+  const price = fdv / SUPPLY / 10 ** (BASE_DECIMALS - quoteDecimals);
+  return new BN(BigInt(Math.round(Math.sqrt(price) * Q64)).toString());
+}
+
+/** What the whole supply is worth at a given sqrt price. */
+function fdvForSqrtPrice(sqrt: BN | string, quoteDecimals: number): number {
+  const p = Number(BigInt(sqrt.toString())) / Q64;
+  return p * p * 10 ** (BASE_DECIMALS - quoteDecimals) * SUPPLY;
+}
+
+/**
+ * A curve that opens where you want AND graduates where you want.
+ *
+ * No builder gives both. buildCurveWithMarketCap prices the open correctly but
+ * derives thresholds far too low to be out of reach; buildCurve takes the
+ * threshold but derives the opening price from a supply percentage, which at an
+ * unreachable threshold puts the open orders of magnitude too high. That is how
+ * the first mainnet launch went out at ~1000x its intended valuation.
+ *
+ * buildCurveWithCustomSqrtPrices takes the two prices directly and derives the
+ * threshold from them, so the threshold is solved for: the end price is the
+ * only free variable, and the threshold rises monotonically with it. Bisection
+ * on a log scale converges in well under sixty steps.
+ *
+ * The result is a single-segment curve, which is the shape hours.fun uses.
+ */
+function buildCurveToTarget(opts: {
   quoteDecimals: number;
-  /** Quote tokens that must flow in before the curve completes. */
+  openFdv: number;
   migrationThreshold: number;
-  /** Share of supply handed to the migrated pool; the rest sells on the curve. */
-  supplyOnMigrationPct: number;
   cliffFeeNumerator: number;
   creatorSharePct: number;
 }) {
-  return buildCurveFromThreshold({
+  const shape = (endFdv: number) =>
+    buildCurveWithCustomSqrtPrices({
+      ...curveShell(opts.quoteDecimals, opts.cliffFeeNumerator, opts.creatorSharePct),
+      sqrtPrices: [
+        sqrtPriceForFdv(opts.openFdv, opts.quoteDecimals),
+        sqrtPriceForFdv(endFdv, opts.quoteDecimals),
+      ],
+    } as any) as any;
+
+  const thresholdOf = (c: any) => Number(c.migrationQuoteThreshold) / 10 ** opts.quoteDecimals;
+
+  let lo = opts.openFdv * 1e5;
+  let hi = opts.openFdv * 1e9;
+  for (let i = 0; i < 60; i++) {
+    const mid = Math.sqrt(lo * hi);
+    let below: boolean;
+    // Extreme ratios make the builder throw rather than return; treat a throw
+    // as "too low" so the search walks up out of the unusable region.
+    try { below = thresholdOf(shape(mid)) < opts.migrationThreshold; } catch { below = true; }
+    below ? (lo = mid) : (hi = mid);
+  }
+  const curve = shape(hi);
+  const got = thresholdOf(curve);
+  // Bisection lands close, not exact. A threshold that drifted low would make
+  // graduation reachable, which is the one thing it must not be.
+  if (got < opts.migrationThreshold * 0.999) {
+    throw new Error(
+      `could not reach a ${opts.migrationThreshold.toLocaleString()} threshold at a ` +
+        `${opts.openFdv.toLocaleString()} open; best was ${got.toLocaleString()}`
+    );
+  }
+  return curve;
+}
+
+/**
+ * Everything about a curve except the prices: token shape, fees, migration,
+ * LP split, vesting. Shared so the two builders below cannot drift apart --
+ * a reference curve is only valid under the shape it was built for.
+ */
+function curveShell(quoteDecimals: number, cliffFeeNumerator: number, creatorSharePct: number) {
+  return {
     token: {
       tokenType: 1, // Token-2022, required for a transfer hook
       tokenBaseDecimal: BASE_DECIMALS,
-      tokenQuoteDecimal: opts.quoteDecimals,
+      tokenQuoteDecimal: quoteDecimals,
       tokenAuthorityOption: 1, // Immutable
       totalTokenSupply: SUPPLY,
       leftover: 0,
@@ -169,15 +238,15 @@ function buildCurveConfig(opts: {
       baseFeeParams: {
         baseFeeMode: 0, // FeeSchedulerLinear
         feeSchedulerParam: {
-          startingFeeBps: feeBps(opts.cliffFeeNumerator),
-          endingFeeBps: feeBps(opts.cliffFeeNumerator),
+          startingFeeBps: feeBps(cliffFeeNumerator),
+          endingFeeBps: feeBps(cliffFeeNumerator),
           numberOfPeriod: 0,
           totalDuration: 0,
         },
       },
       dynamicFeeEnabled: false,
       collectFeeMode: 0, // QuoteToken
-      creatorTradingFeePercentage: opts.creatorSharePct,
+      creatorTradingFeePercentage: creatorSharePct,
       poolCreationFee: 0,
       enableFirstSwapWithMinFee: false,
     },
@@ -198,9 +267,8 @@ function buildCurveConfig(opts: {
       creatorPermanentLockedLiquidityPercentage: 50,
       creatorLiquidityPercentage: 0,
     },
-    // No vesting. These are the builder's HIGH-LEVEL inputs, not the
-    // already-computed on-chain shape: it derives amountPerPeriod itself and
-    // short-circuits cleanly only when totalLockedVestingAmount is 0.
+    // No vesting. Also unusable here even if wanted: vesting is measured from
+    // migration time, and the migration threshold is set out of reach.
     lockedVesting: {
       totalLockedVestingAmount: 0,
       numberOfVestingPeriod: 0,
@@ -209,12 +277,26 @@ function buildCurveConfig(opts: {
       cliffDurationFromMigrationTime: 0,
     },
     activationType: 1, // timestamp
-    // Deliberately NOT buildCurveWithMarketCap: deriving the threshold from a
-    // pair of market caps leaves a rounding residual that makes it throw
-    // "Not enough liquidity" for many perfectly sensible cap pairs, and the
-    // threshold -- not the cap -- is the number that decides whether the
-    // trading hours are permanent. Naming it directly is exact at both the
-    // 9-decimal (SOL) and 8-decimal (xStock) scales.
+  };
+}
+
+/**
+ * A curve from a threshold and a supply split.
+ *
+ * Kept for reference curves copied with --curve-from, where only the prices
+ * are replaced. Do not use it to price a launch: the opening valuation falls
+ * out of the supply percentage rather than being chosen, and at an unreachable
+ * threshold that puts it orders of magnitude too high.
+ */
+function buildCurveConfig(opts: {
+  quoteDecimals: number;
+  migrationThreshold: number;
+  supplyOnMigrationPct: number;
+  cliffFeeNumerator: number;
+  creatorSharePct: number;
+}) {
+  return buildCurveFromThreshold({
+    ...curveShell(opts.quoteDecimals, opts.cliffFeeNumerator, opts.creatorSharePct),
     percentageSupplyOnMigration: opts.supplyOnMigrationPct,
     migrationQuoteThreshold: opts.migrationThreshold,
   } as any);
@@ -223,22 +305,12 @@ function buildCurveConfig(opts: {
 /**
  * Take the PRICE curve from an existing DBC config.
  *
- * The builders force a choice we do not want to make. buildCurveWithMarketCap
- * sets the starting market cap correctly but derives a migration threshold far
- * too low to be unreachable; buildCurve takes the threshold we need but derives
- * the start price from a supply percentage, which on a 100,000 SOL threshold
- * puts the opening valuation about a thousand times too high. Neither gives
- * both.
- *
- * hours.fun achieves both with a single long curve segment -- opening near a 30
- * SOL market cap and running to roughly 593,000,000 SOL before the threshold is
- * reached. Rather than reverse-engineer that, copy it: the numbers are public
- * on chain, and matching them is the point.
- *
- * Only the three price fields are taken. Fees, LP split, creator share and the
- * fee claimer all stay ours, so the reference must agree on everything the
- * curve depends on -- decimals, supply and LP distribution -- or the curve will
- * not absorb exactly the threshold it claims.
+ * Useful when a config already on chain has the economics you want and you
+ * would rather copy proven numbers than derive your own. Only the three price
+ * fields are taken; fees, LP split, creator share and the fee claimer stay
+ * ours. The reference must therefore agree on everything the curve depends on
+ * -- decimals, supply, LP distribution, migration options -- or it will not
+ * absorb exactly the threshold it claims.
  */
 async function curveFromReference(
   connection: Connection,
@@ -444,6 +516,7 @@ async function main() {
         `  --tier   <${Object.keys(FEE_TIERS).join("|")}>  (creator's cut; you always net ~1%)\n` +
         `  --quote  <${Object.keys(QUOTES).join("|")}>  (or --quote-mint <ADDRESS>)\n` +
         `  --threshold <QUOTE TOKENS>  graduation point; keep it unreachable (default 100000)\n` +
+        `  --open-fdv <QUOTE TOKENS>   what the whole supply is worth at launch\n` +
         `  --curve-from <CONFIG>  copy the price curve from an existing DBC config\n` +
         `  --fee-claimer <ADDRESS>  platform fee destination (permanent; default the Ledger)\n` +
         `  --ledger [--ledger-path "44'/501'/0'/0'"] [--expect <ADDRESS>]`
@@ -524,13 +597,27 @@ async function main() {
 
     const migrationThreshold = Number(arg("threshold", "100000"));
     const supplyOnMigrationPct = Number(arg("supply-on-migration", "20"));
-    let curve: any = buildCurveConfig({
-      quoteDecimals: quote.decimals,
-      migrationThreshold,
-      supplyOnMigrationPct,
-      cliffFeeNumerator: FEE_TIERS[tier].cliffFeeNumerator,
-      creatorSharePct: FEE_TIERS[tier].creatorSharePct,
-    });
+    // --open-fdv is the one that produces a sane launch: it says what the whole
+    // supply is worth to the first buyer, and the curve is solved so the
+    // threshold still lands where asked. Without it the opening valuation is
+    // whatever falls out of the supply split, which is how the first mainnet
+    // launch opened about a thousand times too high.
+    const openFdvArg = arg("open-fdv", "");
+    let curve: any = openFdvArg
+      ? buildCurveToTarget({
+          quoteDecimals: quote.decimals,
+          openFdv: Number(openFdvArg),
+          migrationThreshold,
+          cliffFeeNumerator: FEE_TIERS[tier].cliffFeeNumerator,
+          creatorSharePct: FEE_TIERS[tier].creatorSharePct,
+        })
+      : buildCurveConfig({
+          quoteDecimals: quote.decimals,
+          migrationThreshold,
+          supplyOnMigrationPct,
+          cliffFeeNumerator: FEE_TIERS[tier].cliffFeeNumerator,
+          creatorSharePct: FEE_TIERS[tier].creatorSharePct,
+        });
     // --curve-from copies the price curve off an existing config. Without it
     // the derived curve opens roughly a thousand times too high at a 100,000
     // threshold, which is how the first mainnet launch went out at a ~$3.7m
@@ -579,7 +666,11 @@ async function main() {
     const sqrtStart = Number(curve.sqrtStartPrice.toString()) / 2 ** 64;
     const startPrice = sqrtStart * sqrtStart * 10 ** (BASE_DECIMALS - quote.decimals);
     const startFdv = startPrice * SUPPLY;
-    console.log(`  curve source   ${curveFrom ? curveFrom + " (copied price curve)" : "derived"}`);
+    console.log(`  curve source   ${
+      curveFrom ? curveFrom + " (copied price curve)"
+      : openFdvArg ? "solved for the opening valuation and threshold"
+      : "derived from the supply split -- check the opening valuation"
+    }`);
     console.log(`  OPENING VALUATION ${startFdv.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${quoteLabel}`);
     console.log(`                 what the first buyer pays for the whole supply.`);
     console.log(`  graduates at   ${threshold.toLocaleString()} ${quoteLabel}`);
