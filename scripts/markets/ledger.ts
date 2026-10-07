@@ -17,7 +17,7 @@
  */
 import TransportNodeHid from "@ledgerhq/hw-transport-node-hid";
 import Solana from "@ledgerhq/hw-app-solana";
-import { PublicKey, Transaction, Connection } from "@solana/web3.js";
+import { PublicKey, Transaction, VersionedTransaction, Connection } from "@solana/web3.js";
 
 export const DEFAULT_LEDGER_PATH = "44'/501'/0'";
 
@@ -25,6 +25,16 @@ export type LedgerSigner = {
   publicKey: PublicKey;
   /** Sign in place, appending the device's signature to the transaction. */
   sign(tx: Transaction): Promise<Transaction>;
+  /**
+   * Sign a versioned (v0) transaction.
+   *
+   * The device signs a serialized message either way; only the serialization
+   * differs, and a v0 message carries address-lookup-table references instead
+   * of repeating every account key. Older Solana app versions reject the v0
+   * message prefix, so this surfaces that clearly rather than as a generic
+   * refusal.
+   */
+  signV0(tx: VersionedTransaction): Promise<VersionedTransaction>;
   close(): Promise<void>;
 };
 
@@ -100,6 +110,31 @@ export async function openLedger(
       tx.addSignature(publicKey, signature);
       return tx;
     },
+    async signV0(tx: VersionedTransaction) {
+      const message = Buffer.from(tx.message.serialize());
+      let signature: Buffer;
+      try {
+        ({ signature } = await app.signTransaction(path, message));
+      } catch (e: any) {
+        const msg = String(e?.message ?? e);
+        if (/0x6985|denied|rejected/i.test(msg)) {
+          throw new Error("You rejected the transaction on the Ledger. Nothing was sent.");
+        }
+        if (/0x5515|locked/i.test(msg)) {
+          throw new Error("Ledger locked mid-signing. Unlock it and retry; nothing was sent.");
+        }
+        if (/0x6a80|0x6d00|INS_NOT_SUPPORTED|not supported/i.test(msg)) {
+          throw new Error(
+            "This Ledger's Solana app will not sign a versioned (v0) transaction.\n" +
+              "  Update the Solana app in Ledger Live, or drop --lut to use the\n" +
+              "  two-transaction path, which signs legacy messages."
+          );
+        }
+        throw new Error(`Ledger refused to sign: ${msg}`);
+      }
+      tx.addSignature(publicKey, signature);
+      return tx;
+    },
     async close() {
       await transport.close();
     },
@@ -124,6 +159,30 @@ export async function sendWithLedger(
   console.log(`      signing as ${signer.publicKey.toBase58()}`);
   console.log(`      ${tx.instructions.length} instruction(s)`);
   await signer.sign(tx);
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    preflightCommitment: "confirmed",
+  });
+  await connection.confirmTransaction(sig, "confirmed");
+  return sig;
+}
+
+/** Sign a versioned transaction with the device and send it. */
+export async function sendV0WithLedger(
+  connection: Connection,
+  tx: VersionedTransaction,
+  signer: LedgerSigner,
+  extraSigners: { publicKey: PublicKey; secretKey: Uint8Array }[] = []
+): Promise<string> {
+  // Keypairs that must also sign (a new mint, for instance) sign first, so the
+  // device sees the final message.
+  if (extraSigners.length) tx.sign(extraSigners as any);
+
+  console.log("\n  >>> CONFIRM ON THE LEDGER <<<");
+  console.log(`      signing as ${signer.publicKey.toBase58()}`);
+  console.log(`      ${tx.message.compiledInstructions.length} instruction(s), versioned (v0)`);
+  await signer.signV0(tx);
 
   const sig = await connection.sendRawTransaction(tx.serialize(), {
     skipPreflight: false,

@@ -27,6 +27,7 @@
 import {
   Connection, Keypair, PublicKey, SystemProgram, Transaction,
   TransactionInstruction, clusterApiUrl, sendAndConfirmTransaction,
+  VersionedTransaction, TransactionMessage, ComputeBudgetProgram,
 } from "@solana/web3.js";
 import { NATIVE_MINT, getMint, TOKEN_2022_PROGRAM_ID, getExtensionTypes } from "@solana/spl-token";
 import { market, MARKETS, Market } from "./markets/presets";
@@ -35,7 +36,7 @@ import {
   initializeScheduleIx, extraAccountMetasAddress, initializeRegistryIx, registryAddress,
   registerMarketIx, marketAddress, scheduleHash, COMPILED_SCHEDULE_HASHES,
 } from "./markets/hook";
-import { openLedger, sendWithLedger, DEFAULT_LEDGER_PATH, LedgerSigner } from "./markets/ledger";
+import { openLedger, sendWithLedger, sendV0WithLedger, DEFAULT_LEDGER_PATH, LedgerSigner } from "./markets/ledger";
 import {
   DynamicBondingCurveClient,
   deriveDbcPoolAddress,
@@ -298,6 +299,7 @@ function arg(name: string, fallback?: string): string {
 type Signer = {
   publicKey: PublicKey;
   send(connection: Connection, tx: Transaction, extra?: Keypair[]): Promise<string>;
+  sendV0(connection: Connection, tx: VersionedTransaction, extra?: Keypair[]): Promise<string>;
   close(): Promise<void>;
   isLedger: boolean;
 };
@@ -309,6 +311,12 @@ function fileSigner(kp: Keypair): Signer {
     async send(connection, tx, extra = []) {
       return sendAndConfirmTransaction(connection, tx, [kp, ...extra]);
     },
+    async sendV0(connection, tx, extra = []) {
+      tx.sign([kp, ...extra]);
+      const sig = await connection.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
+      await connection.confirmTransaction(sig, "confirmed");
+      return sig;
+    },
     async close() {},
   };
 }
@@ -319,6 +327,9 @@ function ledgerSigner(l: LedgerSigner): Signer {
     isLedger: true,
     async send(connection, tx, extra = []) {
       return sendWithLedger(connection, tx, l, extra as any);
+    },
+    async sendV0(connection, tx, extra = []) {
+      return sendV0WithLedger(connection, tx, l, extra as any);
     },
     close: l.close,
   };
@@ -743,6 +754,9 @@ async function main() {
   // signer here is a throwaway hot wallet, so defaulting this to the signer
   // would quietly send that share to a key you intend to discard.
   const creator = new PublicKey(arg("creator", PLATFORM_FEE_CLAIMER.toBase58()));
+  // With a lookup table the pool creation and the schedule write fit in one
+  // transaction; without one they are 1286 bytes and must be split.
+  const lutAddress = arg("lut", "");
   await assertClaimable(connection, creator, signer, "pool creator", "--creator");
   const baseMint = Keypair.generate();
   // Read the quote mint off the config rather than assuming SOL: the pool
@@ -806,6 +820,7 @@ async function main() {
   );
   console.log(`  transfer hook  ${HOOK_PROGRAM_ID.toBase58()}`);
   console.log(`  pool creator   ${creator.toBase58()}  <-- owns the creator fee share`);
+  console.log(`  transactions   ${lutAddress ? "1 (lookup table " + lutAddress + ")" : "2 (no --lut; pool, then schedule)"}`);
   if (creator.equals(wallet.publicKey)) {
     console.log(`                 WARNING: that is the signing wallet. If this is a`);
     console.log(`                 throwaway hot key, pass --creator <your address>`);
@@ -831,17 +846,46 @@ async function main() {
     transferHookProgram: HOOK_PROGRAM_ID,
     ...(tokenBadge ? { tokenBadge } : {}),
   });
-  const sig = await signer.send(connection, tx, [baseMint]);
-  console.log("\npool created:", sig);
+  const schedIx = initializeScheduleIx(baseMint.publicKey, wallet.publicKey, chosen, viaRegistry);
 
-  // Must happen before anyone can trade.
-  const initSig = await signer.send(
-    connection,
-    new Transaction().add(
-      initializeScheduleIx(baseMint.publicKey, wallet.publicKey, chosen, viaRegistry)
-    )
-  );
-  console.log("schedule + hook state written:", initSig);
+  if (lutAddress) {
+    // One transaction. Both halves land together or neither does, which closes
+    // two gaps in the split version: a token left unusable because the schedule
+    // write failed after the pool was paid for, and the window between the two
+    // in which anyone could call initialize and pick the calendar.
+    const lut = (await connection.getAddressLookupTable(new PublicKey(lutAddress))).value;
+    if (!lut) throw new Error(`no address lookup table at ${lutAddress}`);
+    const blockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
+    const v0 = new VersionedTransaction(
+      new TransactionMessage({
+        payerKey: wallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions: [
+          ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+          ...tx.instructions,
+          schedIx,
+        ],
+      }).compileToV0Message([lut])
+    );
+    const size = v0.serialize().length;
+    console.log(`  single transaction ${size} bytes (limit 1232), ${lut.state.addresses.length} accounts via lookup table`);
+    if (size > 1232) {
+      throw new Error(
+        `combined transaction is ${size} bytes, over the 1232 limit.\n` +
+          `  This market's schedule is too large to pack with the pool creation.\n` +
+          `  Drop --lut to use the two-transaction path.`
+      );
+    }
+    const sig = await signer.sendV0(connection, v0, [baseMint]);
+    console.log("\npool + schedule (one transaction):", sig);
+  } else {
+    const sig = await signer.send(connection, tx, [baseMint]);
+    console.log("\npool created:", sig);
+
+    // Must happen before anyone can trade.
+    const initSig = await signer.send(connection, new Transaction().add(schedIx));
+    console.log("schedule + hook state written:", initSig);
+  }
 
   const extraMetas = extraAccountMetasAddress(baseMint.publicKey);
   const check = await connection.getAccountInfo(extraMetas);
