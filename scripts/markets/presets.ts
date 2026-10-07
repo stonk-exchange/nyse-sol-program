@@ -57,6 +57,15 @@ export const MARKETS: Record<string, Market> = {
   // Two sessions a day with a lunch break, and no daylight saving:
   // China has been a constant UTC+8 since 1991.
   //
+  // Opens and the lunch break match the ShanghaiWindowOracle on
+  // Robinhood Chain 4663 (0x6384667531907bfe70EC7621eD67855881076F11),
+  // read off the contract by stepping block.timestamp. 09:15 covers
+  // the pre-opening auction, which runs 09:15-09:25.
+  //
+  // The close deliberately differs: that oracle shuts at 15:50, which
+  // is no SSE boundary at all. 15:30 is the end of after-hours
+  // fixed-price trading. The chains disagree between 15:30 and 15:50.
+  //
   // Holidays are from exchange_calendars (XSHG), which ends 2026-12-31.
   // Chinese market holidays are announced annually by the State
   // Council and follow the lunar calendar, so unlike NYSE they cannot
@@ -66,13 +75,13 @@ export const MARKETS: Record<string, Market> = {
   // only launch on this while 2026-12-31 is comfortably ahead.
   sse: {
     id: "sse",
-    label: "SSE \u2014 09:30-11:30, 13:00-15:00 CST, Mon-Fri",
+    label: "SSE \u2014 09:15-11:30, 13:00-15:30 CST, Mon-Fri",
     tzOffsetMinutes: 480,
     dstRule: DstRule.None,
     baseDay: 20454,
     windows: [
-      { daysMask: MON_TO_FRI, openMinute: 570, closeMinute: 690 },  // 09:30-11:30
-      { daysMask: MON_TO_FRI, openMinute: 780, closeMinute: 900 },  // 13:00-15:00
+      { daysMask: MON_TO_FRI, openMinute: 555, closeMinute: 690 },  // 09:15-11:30
+      { daysMask: MON_TO_FRI, openMinute: 780, closeMinute: 930 },  // 13:00-15:30
     ],
     holidays: [
       0, 1, 46, 47, 48, 49, 50, 53, 95, 120, 123, 124,

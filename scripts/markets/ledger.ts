@@ -142,11 +142,25 @@ export async function openLedger(
 }
 
 /** Sign with the device and send, printing what the device is being asked to approve. */
+/**
+ * Is this the chain telling us the signed blockhash aged out?
+ *
+ * A device signature takes as long as a person takes to read the screen and
+ * press a button, and a blockhash is only good for 150 slots -- about a minute.
+ * Pausing to check the amount is enough to miss it, and the failure arrives as
+ * a simulation error rather than anything that mentions time.
+ */
+function isExpiredBlockhash(e: any): boolean {
+  const m = String(e?.message ?? e);
+  return /Blockhash not found|block height exceeded|BlockhashNotFound/i.test(m);
+}
+
 export async function sendWithLedger(
   connection: Connection,
   tx: Transaction,
   signer: LedgerSigner,
-  extraSigners: { publicKey: PublicKey; secretKey: Uint8Array }[] = []
+  extraSigners: { publicKey: PublicKey; secretKey: Uint8Array }[] = [],
+  attempt = 1
 ): Promise<string> {
   tx.feePayer = signer.publicKey;
   tx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
@@ -160,10 +174,23 @@ export async function sendWithLedger(
   console.log(`      ${tx.instructions.length} instruction(s)`);
   await signer.sign(tx);
 
-  const sig = await connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-    preflightCommitment: "confirmed",
-  });
+  let sig: string;
+  try {
+    sig = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+    });
+  } catch (e: any) {
+    if (isExpiredBlockhash(e) && attempt < 3) {
+      console.log("\n  The blockhash expired while the device was signing. Retrying --");
+      console.log("  approve a little sooner this time.");
+      // A fresh transaction: the old one carries signatures over a stale message.
+      const fresh = new Transaction();
+      tx.instructions.forEach((ix) => fresh.add(ix));
+      return sendWithLedger(connection, fresh, signer, extraSigners, attempt + 1);
+    }
+    throw e;
+  }
   await connection.confirmTransaction(sig, "confirmed");
   return sig;
 }

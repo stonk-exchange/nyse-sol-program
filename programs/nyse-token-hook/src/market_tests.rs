@@ -425,8 +425,8 @@ pub fn sse_schedule() -> Schedule {
         dst_rule: DST_NONE,
         base_day: 20454, // 2026-01-01
         windows: vec![
-            Window { days_mask: 0b0111110, open_minute: 570, close_minute: 690 }, // 09:30-11:30
-            Window { days_mask: 0b0111110, open_minute: 780, close_minute: 900 }, // 13:00-15:00
+            Window { days_mask: 0b0111110, open_minute: 555, close_minute: 690 }, // 09:15-11:30
+            Window { days_mask: 0b0111110, open_minute: 780, close_minute: 930 }, // 13:00-15:30
         ],
         holidays: vec![0, 1, 46, 47, 48, 49, 50, 53, 95, 120, 123, 124, 169, 267, 273, 274, 277, 278, 279],
         early_closes: vec![],
@@ -460,7 +460,9 @@ fn sse_session_table() {
         (1791252000, MarketState::Holiday),             // 2026-10-06 Tue 10:00 CST holiday
         (1791338400, MarketState::Holiday),             // 2026-10-07 Wed 10:00 CST holiday
         (1791766800, MarketState::Closed),              // 2026-10-12 Mon 09:00 CST pre-open
-        (1791768600, MarketState::Open),                // 2026-10-12 Mon 09:30 CST open bell
+        (1791767640, MarketState::Closed),              // 2026-10-12 Mon 09:14 CST, one minute early
+        (1791767700, MarketState::Open),                // 2026-10-12 Mon 09:15 CST open (pre-auction)
+        (1791768600, MarketState::Open),                // 2026-10-12 Mon 09:30 CST continuous trading
         (1791772200, MarketState::Open),                // 2026-10-12 Mon 10:30 CST mid-morning
         (1791775740, MarketState::Open),                // 2026-10-12 Mon 11:29 CST last min am
         (1791775800, MarketState::Closed),              // 2026-10-12 Mon 11:30 CST lunch starts
@@ -469,7 +471,10 @@ fn sse_session_table() {
         (1791781200, MarketState::Open),                // 2026-10-12 Mon 13:00 CST afternoon open
         (1791784800, MarketState::Open),                // 2026-10-12 Mon 14:00 CST mid-afternoon
         (1791788340, MarketState::Open),                // 2026-10-12 Mon 14:59 CST last min pm
-        (1791788400, MarketState::Closed),              // 2026-10-12 Mon 15:00 CST close bell
+        (1791788400, MarketState::Open),                // 2026-10-12 Mon 15:00 CST (continuous trading has ended)
+        (1791790140, MarketState::Open),                // 2026-10-12 Mon 15:29 CST last open minute
+        (1791790200, MarketState::Closed),              // 2026-10-12 Mon 15:30 CST close
+        (1791791400, MarketState::Closed),              // 2026-10-12 Mon 15:50 CST (the EVM oracle is still open here)
         (1791806400, MarketState::Closed),              // 2026-10-12 Mon 20:00 CST evening
         (1792202400, MarketState::Closed),              // 2026-10-17 Sat 10:00 CST weekend
         (1792288800, MarketState::Closed),              // 2026-10-18 Sun 10:00 CST weekend
@@ -486,19 +491,21 @@ fn sse_session_table() {
 #[test]
 fn sse_lunch_break_is_exact() {
     let s = sse_schedule();
-    // 2026-10-12 is a Monday with no holiday that week.
-    let open_0930 = 1_791_768_600i64;
+    // 2026-10-12 is a Monday with no holiday that week. Boundaries are the ones
+    // measured off the EVM ShanghaiWindowOracle, minute by minute.
+    let open_0915 = 1_791_767_700i64;
     for (offset_min, want) in [
-        (-1i64, MarketState::Closed), // 09:29
-        (0, MarketState::Open),       // 09:30 open
-        (119, MarketState::Open),     // 11:29 last minute before lunch
-        (120, MarketState::Closed),   // 11:30 lunch
-        (209, MarketState::Closed),   // 12:59 last minute of lunch
-        (210, MarketState::Open),     // 13:00 afternoon
-        (329, MarketState::Open),     // 14:59 last minute
-        (330, MarketState::Closed),   // 15:00 close
+        (-1i64, MarketState::Closed), // 09:14
+        (0, MarketState::Open),       // 09:15 open, pre-auction
+        (134, MarketState::Open),     // 11:29 last minute before lunch
+        (135, MarketState::Closed),   // 11:30 lunch
+        (224, MarketState::Closed),   // 12:59 last minute of lunch
+        (225, MarketState::Open),     // 13:00 afternoon
+        (374, MarketState::Open),     // 15:29 last open minute
+        (375, MarketState::Closed),   // 15:30 close
+        (395, MarketState::Closed),   // 15:50, where the EVM oracle would still be open
     ] {
-        assert_eq!(s.state_at(open_0930 + offset_min * 60), want, "09:30 + {offset_min}min");
+        assert_eq!(s.state_at(open_0915 + offset_min * 60), want, "09:15 + {offset_min}min");
     }
 }
 
@@ -510,7 +517,7 @@ fn sse_never_shifts_with_the_seasons() {
     let s = sse_schedule();
     for ts in [1_767_578_400i64, 1_783_303_200] {
         assert_eq!(s.state_at(ts), MarketState::Open);
-        // one minute before the open bell, in both seasons
-        assert_eq!(s.state_at(ts - 31 * 60), MarketState::Closed);
+        // one minute before the 09:15 open, in both seasons
+        assert_eq!(s.state_at(ts - 46 * 60), MarketState::Closed);
     }
 }

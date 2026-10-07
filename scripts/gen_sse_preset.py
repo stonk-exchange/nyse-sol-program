@@ -15,10 +15,26 @@ emit a preset that pretends to know more than the library does.
     python3 scripts/gen_sse_preset.py            # print the TS preset
     python3 scripts/gen_sse_preset.py --horizon  # just report coverage
 
-SSE trades 09:30-11:30 and 13:00-15:00 China Standard Time, Monday to Friday.
+    09:15-11:30 and 13:00-15:30 China Standard Time, Monday to Friday
+
+The opens and the lunch break come from the ShanghaiWindowOracle deployed on
+Robinhood Chain 4663 at 0x6384667531907bfe70EC7621eD67855881076F11, read off
+the contract rather than from a spec: fork the chain, step block.timestamp
+minute by minute, call isOpen(). Measured there: 09:14 shut, 09:15 open, 11:29
+open, 11:30 shut, 12:59 shut, 13:00 open, 15:49 open, 15:50 shut.
+
+THE AFTERNOON CLOSE DELIBERATELY DIFFERS FROM THAT ORACLE. It closes at 15:50,
+which matches no SSE boundary -- the exchange stops continuous trading at 15:00
+and after-hours fixed-price trading at 15:30 -- and looks like a buffer or a
+bug. 15:30 was chosen here instead. The two chains therefore disagree between
+15:30 and 15:50: a token on this schedule is shut while the EVM one is open.
+
+The 09:15 open is kept, and is sound: SSE's pre-opening call auction runs
+09:15-09:25, so the exchange is accepting orders from 09:15.
+
 China has had no daylight saving since 1991, so the UTC offset is a constant
-+08:00 and dstRule is DST_NONE -- which also means the two sessions never
-shift, unlike NYSE's.
++08:00 and dstRule is None -- which also means the two sessions never shift,
+unlike NYSE's.
 """
 import datetime
 import sys
@@ -78,6 +94,15 @@ def main():
     print("  // Two sessions a day with a lunch break, and no daylight saving:")
     print("  // China has been a constant UTC+8 since 1991.")
     print("  //")
+    print("  // Opens and the lunch break match the ShanghaiWindowOracle on")
+    print("  // Robinhood Chain 4663 (0x6384667531907bfe70EC7621eD67855881076F11),")
+    print("  // read off the contract by stepping block.timestamp. 09:15 covers")
+    print("  // the pre-opening auction, which runs 09:15-09:25.")
+    print("  //")
+    print("  // The close deliberately differs: that oracle shuts at 15:50, which")
+    print("  // is no SSE boundary at all. 15:30 is the end of after-hours")
+    print("  // fixed-price trading. The chains disagree between 15:30 and 15:50.")
+    print("  //")
     print(f"  // Holidays are from exchange_calendars (XSHG), which ends {last}.")
     print("  // Chinese market holidays are announced annually by the State")
     print("  // Council and follow the lunar calendar, so unlike NYSE they cannot")
@@ -87,13 +112,13 @@ def main():
     print(f"  // only launch on this while {last} is comfortably ahead.")
     print("  sse: {")
     print('    id: "sse",')
-    print('    label: "SSE \\u2014 09:30-11:30, 13:00-15:00 CST, Mon-Fri",')
+    print('    label: "SSE \\u2014 09:15-11:30, 13:00-15:30 CST, Mon-Fri",')
     print("    tzOffsetMinutes: 480,")
     print("    dstRule: DstRule.None,")
     print(f"    baseDay: {BASE_DAY},")
     print("    windows: [")
-    print(f"      {{ daysMask: MON_TO_FRI, openMinute: 570, closeMinute: 690 }},  // 09:30-11:30")
-    print(f"      {{ daysMask: MON_TO_FRI, openMinute: 780, closeMinute: 900 }},  // 13:00-15:00")
+    print(f"      {{ daysMask: MON_TO_FRI, openMinute: 555, closeMinute: 690 }},  // 09:15-11:30")
+    print(f"      {{ daysMask: MON_TO_FRI, openMinute: 780, closeMinute: 930 }},  // 13:00-15:30")
     print("    ],")
     print("    holidays: [")
     for i in range(0, len(holidays), 12):
