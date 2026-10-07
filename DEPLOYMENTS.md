@@ -68,6 +68,29 @@ be changed, so the fix was a new config.
 
 Reference curve source: `EzzRR1fmvQjkgCnTW7RiVDSBcmK2isEZZyQheBvDeGg9`.
 
+### Launch lookup table
+
+| | |
+| --- | --- |
+| table | `DXS76SxHNj1GvP4nXBsjZ5sXq9x8Te4Zn9T7NPSkiMrm` |
+| for config | `77aqJUCTs6anDL9ypRT6zDh6Y9o8zKQ5ALvXb1JF2SAR` |
+| addresses | 9 |
+| authority | `2WE8bqGTXQVsv1w8BM3Htqg9MQmLKKcfKrQoWubbJLRf` (hot wallet) |
+
+Without it a launch is two transactions, because the pool creation and the
+schedule write come to 1286 bytes together and the limit is 1232. That split
+leaves the token unusable if the second fails -- Token-2022 rejects every
+transfer when the hook's validation state is missing -- and leaves a window in
+which anyone can call `initialize` and pick the calendar.
+
+Most of the overflow is account keys. Nine of them are the same for every
+launch, so referencing them through this table brings the pair to 1105 bytes
+and both halves land together. Tied to the config above, since the config and
+its quote mint are among the nine; a new config needs its own table.
+
+Confirmed on a local chain with the Ledger: it signs versioned (v0)
+transactions, and the resulting mint is identical to the two-transaction path.
+
 ### Tokens
 
 | mint | symbol | pool | config | note |
@@ -99,6 +122,24 @@ The Ledger is the registry authority, the upgrade authority, the fee claimer on
 every config and the pool creator on every token. The hot wallet only ever
 uploads program buffers and pays transaction fees; its key is at
 `~/.config/solana/nyse-deploy-hot.json`, outside this repository.
+
+### Launching another token
+
+One command, one transaction, one approval on the device:
+
+```
+ANCHOR_WALLET=~/.config/solana/nyse-deploy-hot.json \
+npx tsx scripts/launch-dbc.ts token --cluster mainnet-beta \
+  --config 77aqJUCTs6anDL9ypRT6zDh6Y9o8zKQ5ALvXb1JF2SAR \
+  --lut DXS76SxHNj1GvP4nXBsjZ5sXq9x8Te4Zn9T7NPSkiMrm \
+  --name "<NAME>" --symbol "<SYMBOL>" --uri <METADATA URL> \
+  --market nyse --ledger --execute
+```
+
+Drop `--execute` to dry run. Name, symbol and schedule are frozen at launch.
+Costs about 0.017 SOL, paid by the Ledger since `--ledger` makes it the signer.
+
+Drop `--lut` to fall back to the two-transaction path.
 
 ### Claiming
 
