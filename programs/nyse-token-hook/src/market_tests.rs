@@ -412,3 +412,105 @@ fn holiday_table_has_no_gaps_across_the_horizon() {
         );
     }
 }
+
+/// The SSE schedule, as `scripts/gen_sse_preset.py` emits it.
+///
+/// Two sessions with a lunch break and no daylight saving, which between them
+/// exercise paths NYSE never reaches: a second window, and a timezone whose
+/// offset is constant all year.
+pub fn sse_schedule() -> Schedule {
+    Schedule {
+        mint: Pubkey::default(),
+        tz_offset_minutes: 480, // UTC+8, constant since 1991
+        dst_rule: DST_NONE,
+        base_day: 20454, // 2026-01-01
+        windows: vec![
+            Window { days_mask: 0b0111110, open_minute: 570, close_minute: 690 }, // 09:30-11:30
+            Window { days_mask: 0b0111110, open_minute: 780, close_minute: 900 }, // 13:00-15:00
+        ],
+        holidays: vec![0, 1, 46, 47, 48, 49, 50, 53, 95, 120, 123, 124, 169, 267, 273, 274, 277, 278, 279],
+        early_closes: vec![],
+        events: vec![],
+    }
+}
+
+/// Expected values come from the IANA tz database (Asia/Shanghai) and the
+/// XSHG session list, so this table is independent of the code it checks.
+#[test]
+fn sse_session_table() {
+    let s = sse_schedule();
+    const SESSIONS: &[(i64, MarketState)] = &[
+        (1767232800, MarketState::Holiday),             // 2026-01-01 Thu 10:00 CST holiday
+        (1767319200, MarketState::Holiday),             // 2026-01-02 Fri 10:00 CST holiday
+        (1771207200, MarketState::Holiday),             // 2026-02-16 Mon 10:00 CST holiday
+        (1771293600, MarketState::Holiday),             // 2026-02-17 Tue 10:00 CST holiday
+        (1771380000, MarketState::Holiday),             // 2026-02-18 Wed 10:00 CST holiday
+        (1771466400, MarketState::Holiday),             // 2026-02-19 Thu 10:00 CST holiday
+        (1771552800, MarketState::Holiday),             // 2026-02-20 Fri 10:00 CST holiday
+        (1771812000, MarketState::Holiday),             // 2026-02-23 Mon 10:00 CST holiday
+        (1775440800, MarketState::Holiday),             // 2026-04-06 Mon 10:00 CST holiday
+        (1777600800, MarketState::Holiday),             // 2026-05-01 Fri 10:00 CST holiday
+        (1777860000, MarketState::Holiday),             // 2026-05-04 Mon 10:00 CST holiday
+        (1777946400, MarketState::Holiday),             // 2026-05-05 Tue 10:00 CST holiday
+        (1781834400, MarketState::Holiday),             // 2026-06-19 Fri 10:00 CST holiday
+        (1790301600, MarketState::Holiday),             // 2026-09-25 Fri 10:00 CST holiday
+        (1790820000, MarketState::Holiday),             // 2026-10-01 Thu 10:00 CST holiday
+        (1790906400, MarketState::Holiday),             // 2026-10-02 Fri 10:00 CST holiday
+        (1791165600, MarketState::Holiday),             // 2026-10-05 Mon 10:00 CST holiday
+        (1791252000, MarketState::Holiday),             // 2026-10-06 Tue 10:00 CST holiday
+        (1791338400, MarketState::Holiday),             // 2026-10-07 Wed 10:00 CST holiday
+        (1791766800, MarketState::Closed),              // 2026-10-12 Mon 09:00 CST pre-open
+        (1791768600, MarketState::Open),                // 2026-10-12 Mon 09:30 CST open bell
+        (1791772200, MarketState::Open),                // 2026-10-12 Mon 10:30 CST mid-morning
+        (1791775740, MarketState::Open),                // 2026-10-12 Mon 11:29 CST last min am
+        (1791775800, MarketState::Closed),              // 2026-10-12 Mon 11:30 CST lunch starts
+        (1791778500, MarketState::Closed),              // 2026-10-12 Mon 12:15 CST mid-lunch
+        (1791781140, MarketState::Closed),              // 2026-10-12 Mon 12:59 CST last min lunch
+        (1791781200, MarketState::Open),                // 2026-10-12 Mon 13:00 CST afternoon open
+        (1791784800, MarketState::Open),                // 2026-10-12 Mon 14:00 CST mid-afternoon
+        (1791788340, MarketState::Open),                // 2026-10-12 Mon 14:59 CST last min pm
+        (1791788400, MarketState::Closed),              // 2026-10-12 Mon 15:00 CST close bell
+        (1791806400, MarketState::Closed),              // 2026-10-12 Mon 20:00 CST evening
+        (1792202400, MarketState::Closed),              // 2026-10-17 Sat 10:00 CST weekend
+        (1792288800, MarketState::Closed),              // 2026-10-18 Sun 10:00 CST weekend
+        (1767578400, MarketState::Open),                // 2026-01-05 Mon 10:00 CST (no DST shift)
+        (1783303200, MarketState::Open),                // 2026-07-06 Mon 10:00 CST (no DST shift)
+    ];
+    for (ts, want) in SESSIONS {
+        assert_eq!(s.state_at(*ts), *want, "at unix {ts}");
+    }
+}
+
+/// The lunch break is the thing a one-window market cannot express, so check it
+/// closes and reopens to the exact minute rather than trusting the table alone.
+#[test]
+fn sse_lunch_break_is_exact() {
+    let s = sse_schedule();
+    // 2026-10-12 is a Monday with no holiday that week.
+    let open_0930 = 1_791_768_600i64;
+    for (offset_min, want) in [
+        (-1i64, MarketState::Closed), // 09:29
+        (0, MarketState::Open),       // 09:30 open
+        (119, MarketState::Open),     // 11:29 last minute before lunch
+        (120, MarketState::Closed),   // 11:30 lunch
+        (209, MarketState::Closed),   // 12:59 last minute of lunch
+        (210, MarketState::Open),     // 13:00 afternoon
+        (329, MarketState::Open),     // 14:59 last minute
+        (330, MarketState::Closed),   // 15:00 close
+    ] {
+        assert_eq!(s.state_at(open_0930 + offset_min * 60), want, "09:30 + {offset_min}min");
+    }
+}
+
+/// China abolished daylight saving in 1991. The same wall-clock minute must be
+/// open in January and in July -- the bug this catches is a US or EU DST rule
+/// leaking into a market that has none.
+#[test]
+fn sse_never_shifts_with_the_seasons() {
+    let s = sse_schedule();
+    for ts in [1_767_578_400i64, 1_783_303_200] {
+        assert_eq!(s.state_at(ts), MarketState::Open);
+        // one minute before the open bell, in both seasons
+        assert_eq!(s.state_at(ts - 31 * 60), MarketState::Closed);
+    }
+}
