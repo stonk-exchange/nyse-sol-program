@@ -44,6 +44,37 @@ program upgrade. Approving or revoking affects only future launches — a token
 copies its schedule into its own account at launch and nothing can reach it
 afterwards.
 
+### Calendars
+
+| market | hours | holiday horizon | how it is approved |
+| --- | --- | --- | --- |
+| `nyse` | 09:30–16:00 ET, Mon–Fri | **2046** | compiled into the program |
+| `sse` | 09:15–11:30 and 13:00–15:30 CST, Mon–Fri | **2026-12-31** | registry, PDA `BF2GHyuNAETacfgE749pSWvKxi9CWdLwP7ifB4uN3rCj` |
+
+SSE's schedule hash is `273e630e59028ffbba085b253f0b74129ac05dd98e831f8188d9944d2a432304`,
+and the stored hash on chain was read back and matches.
+
+SSE is the first calendar added through the registry rather than compiled in,
+which is the proof that the registry works: a new market needs no program
+upgrade and no new hook address.
+
+Its hours were read off the ShanghaiWindowOracle on Robinhood Chain 4663
+(`0x6384667531907bfe70EC7621eD67855881076F11`) by forking that chain and
+stepping `block.timestamp` a minute at a time. The 09:15 open and the lunch
+break match it. **The close does not**: that oracle shuts at 15:50, which is no
+SSE boundary, so 15:30 — the end of after-hours fixed-price trading — was used
+instead. Between 15:30 and 15:50 the two chains disagree, Solana shut and EVM
+open.
+
+**SSE's holiday table ends 2026-12-31.** Chinese market holidays are announced
+annually and follow the lunar calendar, so they cannot be extrapolated the way
+NYSE's can. Past that date an SSE token still enforces weekends and both
+sessions but stops blocking holidays, and a token copies its schedule at launch.
+Extending it for FUTURE tokens means registering a new calendar. Extending it
+for tokens already live needs an `append_holidays` instruction, which does not
+exist yet and would require the upgrade authority — so do not burn before
+deciding.
+
 ### DBC configs
 
 A config's `feeClaimer` is set at creation and **no instruction anywhere in DBC
